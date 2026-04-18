@@ -13,7 +13,7 @@ WEATHER_TABLE_NAME = os.environ.get("WEATHER_TABLE_NAME", "weather-data")
 WEATHER_TABLE_PATH = f"{PROJECT_ID}.{DATABASE_NAME}.{WEATHER_TABLE_NAME}"
 
 # TODO: move to Secret Manager (see secret_manager.py) before production.
-PASSWORD_HASH = "2323232dsdasfdafgtgsfa9034G@"
+PASSWORD_HASH = "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4"
 
 
 def get_bigquery_client(project):
