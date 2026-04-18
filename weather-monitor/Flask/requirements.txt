@@ -1,4 +1,13 @@
-google-cloud-bigquery
+flask>=3.0.0
+flask-cors>=4.0.0
+gunicorn>=21.2.0
+requests==2.32.*
+pytest>=7.0.0
+google-cloud-bigquery==3.40.1
+google-cloud-bigquery-storage==2.36.2
+google-cloud-secret-manager==2.26.0
+google-auth>=2.29.0
+elasticsearch>=8.13.0,<9.0.0
+google_crc32c
 db-dtypes
-Flask
-requests
+python-dotenv>=1.0.0

@@ -1,20 +1,14 @@
-# app/Dockerfile
+FROM python:3.13-slim
 
-FROM python:3.9-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    software-properties-common \
-    && rm -rf /var/lib/apt/lists/*
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ./main.py ./
-COPY ./requirements.txt ./
+COPY src/ ./src/
 
-RUN pip3 install -r requirements.txt
+EXPOSE 8080
 
-
-ENTRYPOINT ["python"]
-CMD ["main.py"]
+CMD exec gunicorn src.main:app --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120
