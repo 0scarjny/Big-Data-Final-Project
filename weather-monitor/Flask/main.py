@@ -36,7 +36,7 @@ def send_to_bigquery():
         # data["outdoor_humidity"] = ...
         # data["weather"] = ...
         # building the query
-        q = """INSERT INTO `data-buckets-489022.Lab4_IoT_datasets.weather-records` 
+        q = """INSERT INTO `data-buckets-489022.weather_records.weather-data` 
         """
         names = """"""
         values = """"""
