@@ -15,10 +15,8 @@ import math
 import asyncio
 import _thread
 
-
 import wifi_manager
-from api_func import get_location_from_ip, IPDATA_KEY 
-
+from api_func import get_location_from_ip, IPDATA_KEY
 
 # --- UI and Sensor Globals ---
 page0 = None
@@ -44,6 +42,7 @@ ampm_label = None
 time_label = None
 date_label = None
 wifi_ind = None
+location_label = None
 
 # Page 1 (Wi-Fi menu) elements
 wifi_title = None
@@ -77,6 +76,7 @@ humidity = None
 temperature = None
 co2 = None
 h = None
+location_str = None
 
 is_scanning = False
 is_connecting = False
@@ -101,7 +101,7 @@ def init_hardware():
     global temp_int_label, temp_dec_label, hum_val_label, hum_pct_label, co2_label
     global comfort_arrow, bar_dry, bar_comfort, bar_wet
     global lbl_dry, lbl_comfort, lbl_wet, divider_line
-    global ampm_label, time_label, date_label, wifi_ind
+    global ampm_label, time_label, date_label, wifi_ind, location_label
     global wlan_sta, i2c0, env3_0, tvoc_0, h  # <-- Added tvoc_0 to globals
 
     M5.begin()
@@ -159,6 +159,7 @@ def init_hardware():
     time_label = m5ui.M5Label("--:--:--",  x=55,  y=165, text_c=text_color, bg_opa=0, font=font_large,  parent=page0)
     date_label = m5ui.M5Label("-/--",      x=230, y=170, text_c=text_color, bg_opa=0, font=font_medium, parent=page0)
     wifi_ind   = m5ui.M5Label(lv.SYMBOL.WIFI, x=300, y=5, text_c=0xE74C3C, bg_opa=0, font=font_small,   parent=page0)
+    location_label = m5ui.M5Label("", x=130, y=218, text_c=text_color, bg_opa=0, font=font_small, parent=page0)
 
     # ================= PAGE 1: Wi-Fi menu =================
     _build_wifi_page(font_small, font_tiny, text_color, bg_color)
@@ -174,7 +175,10 @@ def init_hardware():
 
     passwd = "1234"
     h = hashlib.sha256(passwd)
-    
+
+    _thread.stack_size(16384)
+    _thread.start_new_thread(_location_thread, ())
+
     # ══ Hardware init ════════════════════════════════════════════════════════
     i2c0   = I2C(0, scl=Pin(33), sda=Pin(32), freq=100000)        # Port A
     i2c1   = SoftI2C(scl=Pin(13), sda=Pin(14), freq=100000)       # Port C (soft)
@@ -505,6 +509,28 @@ def _connect_thread(ssid, password):
         _ui_log("_connect_thread: exit")
 
 
+def _location_thread():
+    global location_str
+    _ui_log("_location_thread: enter")
+    for _ in range(30):
+        if wlan_sta is not None and wlan_sta.isconnected():
+            time.sleep(1)  # let DNS / network stack settle before the HTTP call
+            try:
+                location = get_location_from_ip(IPDATA_KEY)
+                _ui_log("_location_thread: got", location)
+                if location:
+                    location_str = str(location)
+                    x = max(0, 160 - (len(location_str) * 7) // 2)
+                    location_label.set_pos(x, 218)
+                    location_label.set_text(location_str)
+            except Exception as e:
+                _ui_log("_location_thread: error:", e)
+            return location_str
+        time.sleep(1)
+    _ui_log("_location_thread: timed out waiting for wifi")
+    return location_str
+
+
 def _boot_autoconnect_thread():
     _ui_log("_boot_autoconnect_thread: enter")
     try:
@@ -566,7 +592,6 @@ def read_sensor():
             
         # TVOC logic <-- Added
         if tvoc_0 is not None:
-            _ui_log("tvoc", tvoc_0.co2eq())
             co2 = tvoc_0.co2eq()
             co2_label.set_text("CO2: {} ppm".format(str(co2)))
 
@@ -591,7 +616,9 @@ def send_data_thread(temp_val, hum_val, co2_val):
             "indoor_humidity": float(hum_val),
             "indoor_co2": float(co2_val)
         },
+        "location": location_str,
     }
+    print(f"Prepared data for sending:", data)
     try:
         http_req = requests2.post(
             'https://flask-app-868833155300.europe-west6.run.app/send-to-bigquery',
