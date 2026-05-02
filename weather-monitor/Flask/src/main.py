@@ -108,17 +108,21 @@ def voice_assistant():
         return {"status": "failed", "error": "empty body"}, 400
 
     log.info("Voice request: %d bytes of audio received", len(wav_bytes))
-    transcript = voice.transcribe(wav_bytes)
+    transcript, language = voice.transcribe(wav_bytes)
 
     if not transcript:
-        reply_text = "Sorry, I didn't catch that. Please try again."
+        # No speech detected — skip intent + dispatch, return a localized
+        # "didn't catch that" via the formatter's fallback table.
         intent = {"action": "unknown"}
+        facts = {"status": "no_speech"}
+        reply_text = voice._fallback_message({"status": "unknown_intent"}, language)
     else:
         intent = voice.parse_intent(transcript)
-        reply_text = actions.dispatch(intent)
+        facts = actions.dispatch(intent)
+        reply_text = voice.format_response(facts, language, transcript)
 
-    log.info("Synthesising reply: %r", reply_text)
-    pcm = voice.synthesize(reply_text)
+    log.info("Synthesising reply [%s]: %r", language, reply_text)
+    pcm = voice.synthesize(reply_text, language_code=language)
     log.info("TTS produced %d bytes of PCM audio", len(pcm))
     return Response(
         pcm,
@@ -126,6 +130,7 @@ def voice_assistant():
         headers={
             "X-Response-Text": voice.header_safe(reply_text)[:512],
             "X-Transcript": voice.header_safe(transcript)[:512],
+            "X-Language": voice.header_safe(language)[:32],
             "X-Intent-Action": voice.header_safe(str(intent.get("action", "unknown")))[:64],
         },
     )
@@ -135,17 +140,27 @@ def voice_assistant():
 def voice_assistant_text():
     """Test helper: skip STT/TTS, send a text question, get a JSON reply.
 
-    Same auth as /voice-assistant. Body: {"text": "What was the temperature yesterday?"}
+    Same auth as /voice-assistant. Body:
+        {"text": "...", "language": "fr-FR"}   # language is optional, default en-US
     """
     if request.headers.get("X-Shared-Secret") != PASSWORD_HASH:
         return {"status": "failed", "error": "auth"}, 401
     payload = request.get_json(force=True) or {}
     transcript = (payload.get("text") or "").strip()
+    language = (payload.get("language") or "en-US").strip()
     if not transcript:
         return {"status": "failed", "error": "missing 'text'"}, 400
     intent = voice.parse_intent(transcript)
-    reply_text = actions.dispatch(intent)
-    out = {"status": "success", "transcript": transcript, "intent": intent, "reply": reply_text}
+    facts = actions.dispatch(intent)
+    reply = voice.format_response(facts, language, transcript)
+    out = {
+        "status": "success",
+        "transcript": transcript,
+        "language": language,
+        "intent": intent,
+        "facts": facts,
+        "reply": reply,
+    }
     if intent.get("_error"):
         out["intent_error"] = intent["_error"]
     return out

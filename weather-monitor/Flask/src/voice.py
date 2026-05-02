@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import unicodedata
 
 from google import genai
 from google.genai import types as genai_types
@@ -29,8 +30,26 @@ log = get_logger("voice_assistant.voice")
 
 
 SAMPLE_RATE = 16000
-LANGUAGE_CODE = "en-US"
-TTS_VOICE_NAME = "en-US-Standard-C"
+
+# STT: primary + alternates. Google's recognizer auto-picks the best match
+# and reports the chosen one in result.language_code.
+PRIMARY_LANGUAGE = "en-US"
+ALTERNATIVE_LANGUAGES = ["fr-FR"]
+
+# TTS voice per detected language. Keep the keys lowercase BCP-47 prefixes
+# (just the language part) so we match regardless of region variants.
+TTS_VOICES = {
+    "en": ("en-US", "en-US-Standard-C"),
+    "fr": ("fr-FR", "fr-FR-Standard-C"),
+}
+DEFAULT_VOICE = TTS_VOICES["en"]
+
+# Human-readable names for the formatter prompt.
+LANGUAGE_NAMES = {
+    "en": "English",
+    "fr": "French",
+}
+
 
 INTENT_SYSTEM_PROMPT = """You convert a user's spoken question about home weather/sensor data into a JSON action.
 
@@ -51,14 +70,40 @@ Available actions:
 5. unknown — question doesn't match any action above.
    Fields: none.
 
+The user may ask in English or French. The available actions are the same regardless of language — interpret the meaning of the question, not its surface form.
+
 Always respond with a single JSON object, no prose, no markdown. Examples:
 
 "What was the temperature yesterday?" -> {"action":"historical_indoor","metric":"indoor_temp","day_offset":-1}
+"Quelle était la température hier?" -> {"action":"historical_indoor","metric":"indoor_temp","day_offset":-1}
 "Did humidity exceed 50% two days ago?" -> {"action":"threshold_check","metric":"indoor_humidity","threshold":50,"comparator":"above","day_offset":-2}
+"L'humidité a-t-elle dépassé 50% il y a deux jours?" -> {"action":"threshold_check","metric":"indoor_humidity","threshold":50,"comparator":"above","day_offset":-2}
 "How much CO2 is there right now?" -> {"action":"current_indoor","metric":"indoor_co2"}
 "Should I take an umbrella tomorrow?" -> {"action":"forecast_umbrella","hours_ahead":24}
+"Faut-il prendre un parapluie demain?" -> {"action":"forecast_umbrella","hours_ahead":24}
 "What's the meaning of life?" -> {"action":"unknown"}
 """
+
+
+RESPONSE_SYSTEM_PROMPT = """You are a friendly home weather assistant on a small smart-display device.
+
+You receive: (1) the user's original spoken question, (2) the target language to reply in, (3) a JSON fact bundle from the backend.
+
+Your job: produce ONE short natural sentence (≤ 25 words, ideally 12–20) in the target language that answers the question using the facts.
+
+Rules:
+- Reply ONLY in the target language. No translation prefix, no quotes, no markdown.
+- Use the units in the fact bundle exactly. Round/format numbers naturally for the language (French uses comma as decimal separator).
+- Don't restate every field — pick what's most relevant to the question.
+- If status == "no_data": apologise briefly that the data isn't available.
+- If status == "bad_input": briefly explain what's wrong (unknown metric / future date / unknown city / missing info).
+- If status == "error": say something went wrong and to try again.
+- If status == "unknown_intent": say you didn't understand the question.
+- For threshold_check.crossed=true: confirm yes and mention the extreme value. crossed=false: confirm no with the extreme value.
+- For forecast_umbrella.rain_expected=true: recommend the umbrella and mention when. false: say no umbrella needed.
+- Never invent numbers that aren't in the facts.
+
+Output ONLY the sentence. Nothing else."""
 
 
 # Tried in order. Allow override via GEMINI_MODEL env var.
@@ -165,36 +210,52 @@ def _strip_json_fences(text):
 
 
 def transcribe(audio_bytes):
-    """Accepts WAV (LINEAR16/16kHz/mono). Returns the transcript or empty string."""
+    """Accepts WAV (LINEAR16/16kHz/mono). Returns (transcript, language_code).
+
+    Uses Google STT's multi-language detection: the primary language is en-US
+    and we list fr-FR as an alternative. The recognizer auto-picks per result
+    and reports the chosen one in result.language_code.
+    See https://docs.cloud.google.com/speech-to-text/docs/multiple-languages
+    """
     log.debug("STT: received %d bytes of audio", len(audio_bytes))
     audio = speech.RecognitionAudio(content=audio_bytes)
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=SAMPLE_RATE,
-        language_code=LANGUAGE_CODE,
+        language_code=PRIMARY_LANGUAGE,
+        alternative_language_codes=ALTERNATIVE_LANGUAGES,
         enable_automatic_punctuation=True,
     )
     response = speech_client.recognize(config=config, audio=audio)
     log.debug("STT: got %d result(s) from Google Speech", len(response.results))
     for i, result in enumerate(response.results):
+        lang = getattr(result, "language_code", "") or "?"
         for j, alt in enumerate(result.alternatives):
             log.debug(
-                "STT result[%d] alt[%d]: confidence=%.2f transcript=%r",
-                i, j, alt.confidence, alt.transcript,
+                "STT result[%d] alt[%d] lang=%s confidence=%.2f transcript=%r",
+                i, j, lang, alt.confidence, alt.transcript,
             )
 
     parts = [r.alternatives[0].transcript for r in response.results if r.alternatives]
     transcript = " ".join(parts).strip()
 
+    # Pick the language from the first result that has one. Fallback to primary.
+    detected = PRIMARY_LANGUAGE
+    for r in response.results:
+        code = getattr(r, "language_code", "") or ""
+        if code:
+            detected = code
+            break
+
     if transcript:
-        log.info("STT transcript: %r", transcript)
+        log.info("STT transcript [%s]: %r", detected, transcript)
     else:
         log.warning(
             "STT returned empty transcript — %d result(s) received. "
             "Check WAV format (must be LINEAR16, 16 kHz, mono) and that the recording contains speech.",
             len(response.results),
         )
-    return transcript
+    return transcript, detected
 
 
 def parse_intent(transcript):
@@ -229,12 +290,91 @@ def parse_intent(transcript):
 _HEADER_SAFE = re.compile(r"[^\x20-\x7E]")
 
 
-def synthesize(text):
-    """Returns raw LINEAR16 PCM bytes at 16kHz. No WAV header."""
+def _voice_for_language(language_code):
+    """Map a BCP-47 language code (e.g. 'fr-FR') to a (lang, voice_name) pair."""
+    prefix = (language_code or "").split("-", 1)[0].lower()
+    return TTS_VOICES.get(prefix, DEFAULT_VOICE)
+
+
+def _language_name(language_code):
+    prefix = (language_code or "").split("-", 1)[0].lower()
+    return LANGUAGE_NAMES.get(prefix, "English")
+
+
+def format_response(facts, language_code, transcript=""):
+    """Generate a natural-language reply directly in `language_code` from
+    structured facts. One LLM call, no translation step.
+
+    Returns a plain string ready for TTS. On failure falls back to a minimal
+    canned message in the target language so the user still hears something.
+    """
+    target = _language_name(language_code)
+    user_msg = (
+        f"User question: {transcript or '(no transcript)'}\n"
+        f"Reply language: {target}\n"
+        f"Facts:\n{json.dumps(facts, ensure_ascii=False, default=str)}"
+    )
+    log.debug("Formatter prompt: %s", user_msg)
+
+    try:
+        model_name = _pick_model()
+        resp = _client().models.generate_content(
+            model=model_name,
+            contents=user_msg,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=RESPONSE_SYSTEM_PROMPT,
+                max_output_tokens=200,
+                temperature=0.3,
+            ),
+        )
+        reply = (resp.text or "").strip().strip('"').strip("'")
+        if reply:
+            log.info("Formatted reply [%s]: %r", language_code, reply)
+            return reply
+        log.warning("Formatter returned empty text for facts: %s", facts)
+    except Exception as e:
+        log.error("Formatter failed: %s: %s", type(e).__name__, e)
+
+    return _fallback_message(facts, language_code)
+
+
+_FALLBACK = {
+    "en": {
+        "ok":            "I have your data but couldn't phrase a reply.",
+        "no_data":       "I don't have data for that period.",
+        "bad_input":     "I couldn't process that request.",
+        "error":         "Something went wrong. Please try again.",
+        "unknown_intent":"Sorry, I didn't understand the question.",
+        "default":       "Sorry, something went wrong.",
+    },
+    "fr": {
+        "ok":            "J'ai les données mais je n'ai pas pu formuler de réponse.",
+        "no_data":       "Je n'ai pas de données pour cette période.",
+        "bad_input":     "Je n'ai pas pu traiter cette demande.",
+        "error":         "Une erreur s'est produite. Veuillez réessayer.",
+        "unknown_intent":"Désolé, je n'ai pas compris la question.",
+        "default":       "Désolé, une erreur s'est produite.",
+    },
+}
+
+
+def _fallback_message(facts, language_code):
+    prefix = (language_code or "").split("-", 1)[0].lower()
+    table = _FALLBACK.get(prefix, _FALLBACK["en"])
+    status = (facts or {}).get("status", "default")
+    return table.get(status, table["default"])
+
+
+def synthesize(text, language_code=PRIMARY_LANGUAGE):
+    """Returns raw LINEAR16 PCM bytes at 16kHz. No WAV header.
+
+    The voice is picked based on `language_code` (e.g. 'fr-FR' uses a French voice)."""
+    lang, voice_name = _voice_for_language(language_code)
+    log.debug("TTS: synthesising %d chars with voice %s (%s)", len(text), voice_name, lang)
     synthesis_input = texttospeech.SynthesisInput(text=text)
     voice = texttospeech.VoiceSelectionParams(
-        language_code=LANGUAGE_CODE,
-        name=TTS_VOICE_NAME,
+        language_code=lang,
+        name=voice_name,
     )
     audio_config = texttospeech.AudioConfig(
         audio_encoding=texttospeech.AudioEncoding.LINEAR16,
@@ -259,5 +399,14 @@ def _strip_wav_header(wav):
 
 
 def header_safe(text):
-    """ASCII-only, no control chars, for HTTP header values."""
-    return _HEADER_SAFE.sub("?", text)
+    """ASCII-only, no control chars, for HTTP header values.
+
+    Strips accents instead of replacing with '?', so French text stays
+    readable when shown on the device's status label (e.g. 'élève' -> 'eleve').
+    """
+    if not text:
+        return ""
+    # NFKD splits 'é' -> 'e' + combining acute; the combining mark is non-ASCII
+    # and gets dropped by encode/decode.
+    normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return _HEADER_SAFE.sub("?", normalized)
