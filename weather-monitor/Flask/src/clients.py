@@ -98,3 +98,4 @@ def get_vertex_credentials():
 
 # Startup probe: used by the insert route to check each column's dtype.
 df = client.query(f"SELECT * FROM `{WEATHER_TABLE_PATH}` LIMIT 10").to_dataframe()
+
