@@ -177,9 +177,13 @@ def current_indoor(metric):
     }
 
 
-def forecast_umbrella(hours_ahead=24, city=None):
+def forecast_weather(hours_ahead=24, city=None):
+    """General weather forecast for the next N hours: temperature range,
+    dominant condition, rain info, humidity. Replaces the old umbrella-only
+    action so the formatter can answer 'what's the weather like tomorrow?'
+    as easily as 'do I need an umbrella?'."""
     city = city or DEFAULT_CITY
-    base = {"intent": "forecast_umbrella", "city": city, "hours_ahead": hours_ahead}
+    base = {"intent": "forecast_weather", "city": city, "hours_ahead": hours_ahead}
     try:
         data = openweather.fetch_forecast(city)
     except Exception as e:
@@ -188,26 +192,57 @@ def forecast_umbrella(hours_ahead=24, city=None):
     if data is None:
         return {**base, "status": "bad_input", "reason": "city_not_found"}
 
+    # OpenWeather returns UTC timestamps + the city's offset in seconds. Use it
+    # so 'tomorrow morning' lines up with the user's local clock.
+    tz_offset_s = (data.get("city") or {}).get("timezone", 0)
     now_ts = datetime.now(tz=timezone.utc).timestamp()
     cutoff = now_ts + hours_ahead * 3600
+
+    temps = []
+    humidities = []
+    condition_counts = {}
     rain_buckets = []
+    buckets_in_window = 0
+
     for item in data.get("list", []):
         ts = item.get("dt", 0)
         if ts > cutoff:
             break
+        buckets_in_window += 1
+        main = item.get("main") or {}
+        if "temp" in main:
+            temps.append(main["temp"])
+        if "humidity" in main:
+            humidities.append(main["humidity"])
         weather = (item.get("weather") or [{}])[0]
-        if weather.get("main") == "Rain" or item.get("rain"):
+        cond = weather.get("main", "Unknown")
+        condition_counts[cond] = condition_counts.get(cond, 0) + 1
+        if cond == "Rain" or item.get("rain"):
+            local_dt = datetime.fromtimestamp(ts + tz_offset_s, tz=timezone.utc)
             rain_buckets.append({
-                "when": datetime.fromtimestamp(ts).strftime("%A %H:%M"),
+                "when": local_dt.strftime("%A %H:%M"),
                 "description": weather.get("description") or "rain",
             })
+
+    if not temps:
+        return {**base, "status": "no_data"}
+
+    dominant = max(condition_counts.items(), key=lambda kv: kv[1])[0] if condition_counts else "Unknown"
 
     return {
         **base,
         "status": "ok",
+        "temp_min": round(min(temps), 1),
+        "temp_max": round(max(temps), 1),
+        "temp_unit": "°C",
+        "dominant_condition": dominant,
+        "all_conditions": sorted(condition_counts.keys()),
+        "humidity_avg": round(sum(humidities) / len(humidities)) if humidities else None,
+        "humidity_unit": "%",
         "rain_expected": bool(rain_buckets),
         "first_rain": rain_buckets[0] if rain_buckets else None,
-        "rain_count": len(rain_buckets),
+        "rain_buckets": len(rain_buckets),
+        "total_buckets": buckets_in_window,
     }
 
 
@@ -228,8 +263,10 @@ def dispatch(intent):
             )
         elif action == "current_indoor":
             facts = current_indoor(intent["metric"])
-        elif action == "forecast_umbrella":
-            facts = forecast_umbrella(int(intent.get("hours_ahead", 24)), intent.get("city"))
+        elif action in ("forecast_weather", "forecast_umbrella"):
+            # Accept the legacy intent name so an in-flight Gemini cache or
+            # older prompt still routes correctly.
+            facts = forecast_weather(int(intent.get("hours_ahead", 24)), intent.get("city"))
         else:
             facts = {"intent": "unknown", "status": "unknown_intent"}
         log.info("Action facts: %s", facts)

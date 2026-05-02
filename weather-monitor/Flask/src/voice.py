@@ -64,8 +64,16 @@ Available actions:
 3. current_indoor — latest indoor reading.
    Fields: metric.
 
-4. forecast_umbrella — will it rain in the next N hours? Use this for any rain/umbrella/outdoor question.
-   Fields: hours_ahead (positive int, default 24).
+4. forecast_weather — outdoor weather forecast for the next N hours.
+   Use this for ANY question about future weather: rain, temperature, conditions,
+   umbrella, going out, what to wear, etc. The action returns temperature range,
+   dominant condition, rain timing, humidity — the formatter will pick whichever
+   fields answer the question.
+   Fields: hours_ahead (positive int).
+       - "tomorrow"  -> 24
+       - "today" / "this afternoon" / "tonight" -> 12
+       - "this week" / "next few days" -> 72
+       - default if unspecified -> 24
 
 5. unknown — question doesn't match any action above.
    Fields: none.
@@ -79,8 +87,11 @@ Always respond with a single JSON object, no prose, no markdown. Examples:
 "Did humidity exceed 50% two days ago?" -> {"action":"threshold_check","metric":"indoor_humidity","threshold":50,"comparator":"above","day_offset":-2}
 "L'humidité a-t-elle dépassé 50% il y a deux jours?" -> {"action":"threshold_check","metric":"indoor_humidity","threshold":50,"comparator":"above","day_offset":-2}
 "How much CO2 is there right now?" -> {"action":"current_indoor","metric":"indoor_co2"}
-"Should I take an umbrella tomorrow?" -> {"action":"forecast_umbrella","hours_ahead":24}
-"Faut-il prendre un parapluie demain?" -> {"action":"forecast_umbrella","hours_ahead":24}
+"Should I take an umbrella tomorrow?" -> {"action":"forecast_weather","hours_ahead":24}
+"Faut-il prendre un parapluie demain?" -> {"action":"forecast_weather","hours_ahead":24}
+"What will the weather be like tomorrow?" -> {"action":"forecast_weather","hours_ahead":24}
+"Quelle sera la météo de demain?" -> {"action":"forecast_weather","hours_ahead":24}
+"Va-t-il faire chaud cet après-midi?" -> {"action":"forecast_weather","hours_ahead":12}
 "What's the meaning of life?" -> {"action":"unknown"}
 """
 
@@ -89,19 +100,32 @@ RESPONSE_SYSTEM_PROMPT = """You are a friendly home weather assistant on a small
 
 You receive: (1) the user's original spoken question, (2) the target language to reply in, (3) a JSON fact bundle from the backend.
 
-Your job: produce ONE short natural sentence (≤ 25 words, ideally 12–20) in the target language that answers the question using the facts.
+Your job: produce ONE short natural sentence (≤ 50 words, ideally 12–20) in the target language that DIRECTLY answers what the user asked.
+
+How to think:
+1. Re-read the user's question. What did they actually ask for?
+   - "What's the weather tomorrow?" → they want a general forecast (temp + conditions), NOT just whether it rains.
+   - "Will it rain tomorrow?" / "Do I need an umbrella?" → focus on rain.
+   - "How hot tomorrow?" / "Quelle température demain?" → focus on temperature.
+   - "Was it humid yesterday?" → focus on humidity, not temperature.
+2. Pick the fact-bundle fields that match the question. Ignore irrelevant ones.
+3. Phrase the answer naturally in the target language.
 
 Rules:
 - Reply ONLY in the target language. No translation prefix, no quotes, no markdown.
-- Use the units in the fact bundle exactly. Round/format numbers naturally for the language (French uses comma as decimal separator).
-- Don't restate every field — pick what's most relevant to the question.
+- Reply must clearly answer what was asked. If facts.dominant_condition is "Clouds" and the user asked about the weather, mention it's cloudy — don't pivot to whether it rains.
+- Use the units in the fact bundle exactly. French uses comma as decimal separator (23,6 not 23.6).
+- Don't restate every field — keep the sentence short.
 - If status == "no_data": apologise briefly that the data isn't available.
 - If status == "bad_input": briefly explain what's wrong (unknown metric / future date / unknown city / missing info).
 - If status == "error": say something went wrong and to try again.
 - If status == "unknown_intent": say you didn't understand the question.
-- For threshold_check.crossed=true: confirm yes and mention the extreme value. crossed=false: confirm no with the extreme value.
-- For forecast_umbrella.rain_expected=true: recommend the umbrella and mention when. false: say no umbrella needed.
-- Never invent numbers that aren't in the facts.
+- For threshold_check: if crossed, confirm yes with the extreme value; if not, confirm no with it.
+- For forecast_weather:
+    * If the user asked about the WEATHER in general → mention temp range AND dominant_condition; mention rain only if rain_expected=true and relevant.
+    * If the user asked specifically about RAIN/UMBRELLA → focus on rain_expected and first_rain.
+    * If the user asked about TEMPERATURE → focus on temp_min/temp_max.
+- Never invent numbers or facts that aren't in the bundle.
 
 Output ONLY the sentence. Nothing else."""
 
@@ -321,21 +345,51 @@ def format_response(facts, language_code, transcript=""):
         resp = _client().models.generate_content(
             model=model_name,
             contents=user_msg,
-            config=genai_types.GenerateContentConfig(
-                system_instruction=RESPONSE_SYSTEM_PROMPT,
-                max_output_tokens=200,
-                temperature=0.3,
-            ),
+            config=_short_reply_config(),
         )
         reply = (resp.text or "").strip().strip('"').strip("'")
         if reply:
             log.info("Formatted reply [%s]: %r", language_code, reply)
             return reply
-        log.warning("Formatter returned empty text for facts: %s", facts)
+        log.warning("Formatter returned empty text for facts: %s — finish_reason=%s",
+                    facts, _finish_reason(resp))
     except Exception as e:
         log.error("Formatter failed: %s: %s", type(e).__name__, e)
 
     return _fallback_message(facts, language_code)
+
+
+def _short_reply_config():
+    """GenerateContentConfig tuned for short, deterministic responses.
+
+    Gemini 2.5 models burn 'thinking' tokens against max_output_tokens, so
+    a budget like 200 leaves almost nothing for the visible reply. We disable
+    thinking when supported (thinking_budget=0) and bump max_output_tokens.
+    Falls back gracefully on older SDKs that don't expose ThinkingConfig.
+    """
+    base = dict(
+        system_instruction=RESPONSE_SYSTEM_PROMPT,
+        max_output_tokens=512,
+        temperature=0.3,
+    )
+    ThinkingConfig = getattr(genai_types, "ThinkingConfig", None)
+    if ThinkingConfig is not None:
+        try:
+            base["thinking_config"] = ThinkingConfig(thinking_budget=0)
+        except Exception as e:
+            log.debug("ThinkingConfig(thinking_budget=0) unsupported: %s", e)
+    return genai_types.GenerateContentConfig(**base)
+
+
+def _finish_reason(resp):
+    """Pull a human-readable finish reason out of a generate_content response."""
+    try:
+        candidates = getattr(resp, "candidates", None) or []
+        if candidates:
+            return str(getattr(candidates[0], "finish_reason", "unknown"))
+    except Exception:
+        pass
+    return "unknown"
 
 
 _FALLBACK = {

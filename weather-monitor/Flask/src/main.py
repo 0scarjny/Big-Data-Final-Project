@@ -1,7 +1,9 @@
+import json
 import os
 
 import requests
 from flask import Flask, Response, request
+from google.cloud import bigquery
 
 try:
     from src.clients import PASSWORD_HASH, WEATHER_TABLE_PATH, client, df, API_KEY
@@ -28,43 +30,127 @@ def _require_auth(payload):
 @app.route("/send-to-bigquery", methods=["GET", "POST"])
 def send_to_bigquery():
     if request.method == "POST":
-        # 1. Parse payload and authenticate
-        payload = request.get_json(force=True)
-        auth_err = _require_auth(payload)
-        if auth_err:
-            return auth_err
+        return _bigquery_insert()
+    return _bigquery_query()
 
-        # 2. Extract local IoT data and location context
-        local_values = payload.get("values", {})
-        location = payload.get("location", "Lausanne")  # Default city if not provided
 
-        try:
-            # 3. Fetch Outside Weather (Orchestration)
-            owm_data = openweather.fetch_current(location)
-            if owm_data is None:
-                return {"status": "failed", "error": f"City not found: {location}"}, 404
+def _bigquery_insert():
+    """POST: insert one sensor reading + outdoor weather into BigQuery."""
+    payload = request.get_json(force=True)
+    auth_err = _require_auth(payload)
+    if auth_err:
+        return auth_err
 
-            # 4. Merge Data
-            row_to_insert = {
-                **local_values,
-                "outdoor_temp": owm_data["main"]["temp"],
-                "outdoor_humidity": owm_data["main"]["humidity"],
-                "outdoor_weather": owm_data["weather"][0]["description"],
-                "location": location,
-            }
+    local_values = payload.get("values", {})
+    location = payload.get("location", "Lausanne")
 
-            # 5. Safe BigQuery Insertion
-            errors = client.insert_rows_json(WEATHER_TABLE_PATH, [row_to_insert])
+    try:
+        owm_data = openweather.fetch_current(location)
+        if owm_data is None:
+            return {"status": "failed", "error": f"City not found: {location}"}, 404
 
-            if errors:
-                return {"status": "failed", "error": f"BigQuery Insert Error: {errors}"}, 500
+        row_to_insert = {
+            **local_values,
+            "outdoor_temp": owm_data["main"]["temp"],
+            "outdoor_humidity": owm_data["main"]["humidity"],
+            "outdoor_weather": owm_data["weather"][0]["description"],
+            "location": location,
+        }
 
-            return {"status": "success", "inserted_data": row_to_insert}, 200
+        errors = client.insert_rows_json(WEATHER_TABLE_PATH, [row_to_insert])
+        if errors:
+            return {"status": "failed", "error": f"BigQuery Insert Error: {errors}"}, 500
 
-        except requests.exceptions.RequestException as e:
-            return {"status": "failed", "error": f"External API Error: {str(e)}"}, 502
-        except Exception as e:
-            return {"status": "failed", "error": str(e)}, 500
+        return {"status": "success", "inserted_data": row_to_insert}, 200
+
+    except requests.exceptions.RequestException as e:
+        return {"status": "failed", "error": f"External API Error: {str(e)}"}, 502
+    except Exception as e:
+        return {"status": "failed", "error": str(e)}, 500
+
+
+def _bigquery_query():
+    """GET: read sensor data, optionally filtered by date / time range.
+
+    Auth: header `X-Shared-Secret` OR query string `?passwd=<hash>`.
+
+    Query parameters (all optional):
+      start_date  YYYY-MM-DD     inclusive lower bound on `date`
+      end_date    YYYY-MM-DD     inclusive upper bound on `date`
+      start_time  HH:MM:SS       inclusive lower bound on `time` (applied per row)
+      end_time    HH:MM:SS       inclusive upper bound on `time` (applied per row)
+      limit       int (1..1000)  max rows to return, default 50
+
+    With no params, returns the most recent `limit` rows (default 50, newest first).
+    """
+    passwd = request.headers.get("X-Shared-Secret") or request.args.get("passwd")
+    if passwd != PASSWORD_HASH:
+        return {"status": "failed", "error": "Incorrect Password!"}, 401
+
+    start_date = request.args.get("start_date")
+    end_date = request.args.get("end_date")
+    start_time = request.args.get("start_time")
+    end_time = request.args.get("end_time")
+
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        return {"status": "failed", "error": "limit must be an integer"}, 400
+    limit = max(1, min(limit, 1000))
+
+    where_parts = []
+    params = []
+    if start_date:
+        where_parts.append("date >= @start_date")
+        params.append(bigquery.ScalarQueryParameter("start_date", "STRING", start_date))
+    if end_date:
+        where_parts.append("date <= @end_date")
+        params.append(bigquery.ScalarQueryParameter("end_date", "STRING", end_date))
+    if start_time:
+        where_parts.append("time >= @start_time")
+        params.append(bigquery.ScalarQueryParameter("start_time", "STRING", start_time))
+    if end_time:
+        where_parts.append("time <= @end_time")
+        params.append(bigquery.ScalarQueryParameter("end_time", "STRING", end_time))
+
+    where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    sql = f"""
+        SELECT *
+        FROM `{WEATHER_TABLE_PATH}`
+        {where_sql}
+        ORDER BY date DESC, time DESC
+        LIMIT @limit
+    """
+    params.append(bigquery.ScalarQueryParameter("limit", "INT64", limit))
+
+    try:
+        job = client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(query_parameters=params),
+        )
+        rows = [dict(r.items()) for r in job.result()]
+    except Exception as e:
+        log.error("BigQuery query failed: %s", e)
+        return {"status": "failed", "error": f"{type(e).__name__}: {e}"}, 500
+
+    body = {
+        "status": "success",
+        "count": len(rows),
+        "filter": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "start_time": start_time,
+            "end_time": end_time,
+            "limit": limit,
+        },
+        "rows": rows,
+    }
+    # Pretty-print: indent + sort_keys for stable output. default=str handles
+    # any datetime/Decimal that might leak from the BigQuery row dicts.
+    return Response(
+        json.dumps(body, indent=2, sort_keys=True, default=str, ensure_ascii=False) + "\n",
+        mimetype="application/json",
+    )
 
 
 @app.route("/get_outdoor_weather", methods=["POST"])
