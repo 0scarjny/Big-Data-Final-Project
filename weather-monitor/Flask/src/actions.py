@@ -36,9 +36,6 @@ METRICS = {
     "indoor_co2":      {"label": "indoor CO2",         "unit": "ppm", "decimals": 0},
 }
 
-DEFAULT_CITY = "Lausanne"
-
-
 def _today():
     return date.today()
 
@@ -181,8 +178,18 @@ def forecast_weather(hours_ahead=24, city=None):
     """General weather forecast for the next N hours: temperature range,
     dominant condition, rain info, humidity. Replaces the old umbrella-only
     action so the formatter can answer 'what's the weather like tomorrow?'
-    as easily as 'do I need an umbrella?'."""
-    city = city or DEFAULT_CITY
+    as easily as 'do I need an umbrella?'.
+
+    `city` must be provided by the caller (the device sends its own location
+    via X-Device-Location; the user can override per-question by mentioning
+    a place name in their question)."""
+    if not city:
+        return {
+            "intent": "forecast_weather",
+            "status": "bad_input",
+            "reason": "missing_city",
+            "hours_ahead": hours_ahead,
+        }
     base = {"intent": "forecast_weather", "city": city, "hours_ahead": hours_ahead}
     try:
         data = openweather.fetch_forecast(city)

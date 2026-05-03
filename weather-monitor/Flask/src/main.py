@@ -193,7 +193,9 @@ def voice_assistant():
         log.warning("Received empty body on /voice-assistant")
         return {"status": "failed", "error": "empty body"}, 400
 
-    log.info("Voice request: %d bytes of audio received", len(wav_bytes))
+    device_location = (request.headers.get("X-Device-Location") or "").strip()
+    log.info("Voice request: %d bytes of audio received (device_location=%r)",
+             len(wav_bytes), device_location)
     transcript, language = voice.transcribe(wav_bytes)
 
     if not transcript:
@@ -204,6 +206,11 @@ def voice_assistant():
         reply_text = voice._fallback_message({"status": "unknown_intent"}, language)
     else:
         intent = voice.parse_intent(transcript)
+        # Forecast actions need a city. If the user didn't name one in the
+        # question, fall back to the device's reported location.
+        if intent.get("action") == "forecast_weather" and not intent.get("city") and device_location:
+            intent["city"] = device_location
+            log.info("Filled in city from device location: %r", device_location)
         facts = actions.dispatch(intent)
         reply_text = voice.format_response(facts, language, transcript)
 
@@ -227,16 +234,29 @@ def voice_assistant_text():
     """Test helper: skip STT/TTS, send a text question, get a JSON reply.
 
     Same auth as /voice-assistant. Body:
-        {"text": "...", "language": "fr-FR"}   # language is optional, default en-US
+        {
+          "text": "...",
+          "language": "fr-FR",         # optional, default en-US
+          "device_location": "Lausanne"  # optional, used when the question
+                                          # doesn't mention a city
+        }
+    Or send `X-Device-Location` header (matches the /voice-assistant flow).
     """
     if request.headers.get("X-Shared-Secret") != PASSWORD_HASH:
         return {"status": "failed", "error": "auth"}, 401
     payload = request.get_json(force=True) or {}
     transcript = (payload.get("text") or "").strip()
     language = (payload.get("language") or "en-US").strip()
+    device_location = (
+        payload.get("device_location")
+        or request.headers.get("X-Device-Location")
+        or ""
+    ).strip()
     if not transcript:
         return {"status": "failed", "error": "missing 'text'"}, 400
     intent = voice.parse_intent(transcript)
+    if intent.get("action") == "forecast_weather" and not intent.get("city") and device_location:
+        intent["city"] = device_location
     facts = actions.dispatch(intent)
     reply = voice.format_response(facts, language, transcript)
     out = {

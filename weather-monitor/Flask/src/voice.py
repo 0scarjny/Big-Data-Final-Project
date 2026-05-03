@@ -69,11 +69,18 @@ Available actions:
    umbrella, going out, what to wear, etc. The action returns temperature range,
    dominant condition, rain timing, humidity — the formatter will pick whichever
    fields answer the question.
-   Fields: hours_ahead (positive int).
-       - "tomorrow"  -> 24
-       - "today" / "this afternoon" / "tonight" -> 12
-       - "this week" / "next few days" -> 72
-       - default if unspecified -> 24
+   Fields:
+     - hours_ahead (positive int):
+         "tomorrow"  -> 24
+         "today" / "this afternoon" / "tonight" -> 12
+         "this week" / "next few days" -> 72
+         default if unspecified -> 24
+     - city (string, OPTIONAL): include ONLY if the user explicitly mentions
+       a city, town, or place name in the question (e.g. "in Paris",
+       "à Genève", "in New York"). Otherwise OMIT this field — the system
+       will fall back to the device's current location.
+       Use the place name as the user said it, in any language; the geocoder
+       handles localised spellings (Genève, Munich/München, etc.).
 
 5. unknown — question doesn't match any action above.
    Fields: none.
@@ -92,6 +99,10 @@ Always respond with a single JSON object, no prose, no markdown. Examples:
 "What will the weather be like tomorrow?" -> {"action":"forecast_weather","hours_ahead":24}
 "Quelle sera la météo de demain?" -> {"action":"forecast_weather","hours_ahead":24}
 "Va-t-il faire chaud cet après-midi?" -> {"action":"forecast_weather","hours_ahead":12}
+"Will it rain in Geneva tomorrow?" -> {"action":"forecast_weather","hours_ahead":24,"city":"Geneva"}
+"Est-ce qu'il va pleuvoir demain à Genève?" -> {"action":"forecast_weather","hours_ahead":24,"city":"Genève"}
+"Quelle est la météo à Paris ce week-end?" -> {"action":"forecast_weather","hours_ahead":72,"city":"Paris"}
+"What's the weather in New York this evening?" -> {"action":"forecast_weather","hours_ahead":12,"city":"New York"}
 "What's the meaning of life?" -> {"action":"unknown"}
 """
 
