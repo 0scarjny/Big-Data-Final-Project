@@ -1,23 +1,35 @@
-import sys
 import time
-import _thread
 import lvgl as lv
 import m5ui
 
-import wifi_manager
 import voice_client
+import forecast as forecast_mod
 
 DEBUG_UI = True
+
 
 _wlan_sta = None
 
 # Pages (0-indexed):
-#   0: dashboard, 1: voice assistant, 2: Wi-Fi list, 3: password keyboard
+#   0: dashboard
+#   1: forecast (today / 5-day toggle)
+#   2: voice assistant
+#   3: configuration (QR + AP credentials)
 page0 = None
 page1 = None
 page2 = None
 page3 = None
 current_page = 0
+
+# Page-change hook (registered by main.py). Fired on every navigation with
+# (prev_page, current_page) so main.py can lazy-start AP + config server only
+# while page 3 is on screen.
+_page_change_hook = None
+
+
+def set_page_change_hook(cb):
+    global _page_change_hook
+    _page_change_hook = cb
 
 # Page 0 (dashboard) widgets
 temp_int_label = None
@@ -31,26 +43,31 @@ date_label = None
 wifi_ind = None
 location_label = None
 
-# Page 1 (voice) widgets
+# Page 1 (forecast) widgets — built once, populated each refresh
+forecast_title = None
+forecast_subtitle = None
+forecast_toggle_btn = None
+forecast_toggle_label = None
+forecast_status = None
+# Per-slot widgets: top label (hour/day), icon, temp label
+forecast_slots = []   # list of dicts: {"top", "icon", "temp"}
+FORECAST_SLOTS = 5    # used as the wider container; today view fills 5 of 6
+_forecast_view = "today"   # "today" or "week"
+_forecast_data = None      # last successful raw forecast dict
+_forecast_fetching = False
+
+# Page 2 (voice) widgets
 voice_btn_rec = None
 voice_label_status = None
 voice_label_reply = None
 voice_spinner = None
 
-# Page 2 (Wi-Fi list) widgets
-wifi_status_label = None
-wifi_list = None
-wifi_spinner = None
-
-# Page 3 (password) widgets
-pwd_ssid_label = None
-pwd_textarea = None
-pwd_status_label = None
-
-_pending_ssid = None
-_network_click_handlers = []
-is_scanning = False
-is_connecting = False
+# Page 3 (Wi-Fi configuration) widgets
+cfg_status_label = None
+cfg_qr = None
+cfg_qr_fallback_label = None
+cfg_ssid_label = None
+cfg_url_label = None
 
 
 def _ui_log(*args):
@@ -58,9 +75,32 @@ def _ui_log(*args):
         print("[ui]", *args)
 
 
+
+
 def safe_font(size):
     name = "font_montserrat_{}".format(size)
     return getattr(lv, name, lv.font_montserrat_14)
+
+
+def _make_image(parent, src, x, y):
+    """Best-effort image factory. m5ui exposes M5Image on most firmware
+    builds; older ones only have raw lv.image. Returns the LVGL object on
+    success, None on failure (file missing / decoder unavailable)."""
+    try:
+        if hasattr(m5ui, "M5Image"):
+            img = m5ui.M5Image(src, x=x, y=y, parent=parent)
+            return img
+        # Fallback to raw LVGL.
+        ImgCls = getattr(lv, "image", None) or getattr(lv, "img", None)
+        if ImgCls is None:
+            return None
+        img = ImgCls(parent)
+        img.set_src(src)
+        img.set_pos(x, y)
+        return img
+    except Exception as e:
+        _ui_log("M5Image failed for", src, "->", e)
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -103,88 +143,149 @@ def _build_dashboard_page(font_large, font_small, font_tiny, text_color, bg_colo
     location_label = m5ui.M5Label("", x=130, y=218, text_c=text_color, bg_opa=0, font=font_small, parent=page0)
 
 
-def _build_voice_page(font_small, font_tiny, text_color, bg_color):
-    global page1, voice_btn_rec, voice_label_status, voice_label_reply, voice_spinner
+def _build_forecast_page(font_small, font_tiny, text_color, bg_color):
+    """Forecast page: title at top, 5 slots in the middle (icon + label +
+    temp), and a centered toggle button at the bottom that flips between
+    'Today' (next 5 three-hour buckets) and 'Week' (5-day summary)."""
+    global page1, forecast_title, forecast_subtitle
+    global forecast_toggle_btn, forecast_toggle_label, forecast_status, forecast_slots
 
     page1 = m5ui.M5Page(bg_c=bg_color)
-    m5ui.M5Label("Ask Assistant", x=12, y=8, text_c=text_color, bg_opa=0, font=font_small, parent=page1)
 
-    voice_label_status = m5ui.M5Label("Ready", x=12, y=30, text_c=text_color, bg_opa=0, font=font_tiny, parent=page1)
+    forecast_title = m5ui.M5Label("Forecast — Today", x=12, y=8,
+                                   text_c=text_color, bg_opa=0, font=font_small, parent=page1)
+    forecast_subtitle = m5ui.M5Label("--", x=12, y=28,
+                                      text_c=0x555555, bg_opa=0, font=font_tiny, parent=page1)
+
+    # 5 evenly spaced columns across the 320 px width.
+    forecast_slots = []
+    slot_w = 64
+    margin = (320 - slot_w * FORECAST_SLOTS) // 2  # ~0
+    for i in range(FORECAST_SLOTS):
+        x0 = margin + i * slot_w
+        top = m5ui.M5Label("", x=x0 + 16, y=52,
+                            text_c=text_color, bg_opa=0, font=font_tiny, parent=page1)
+        # Icon placeholder; real source filled in by render functions.
+        icon = _make_image(page1, forecast_mod.icon_path("01d"), x=x0 + 4, y=72)
+        temp = m5ui.M5Label("--", x=x0 + 14, y=136,
+                             text_c=text_color, bg_opa=0, font=font_tiny, parent=page1)
+        forecast_slots.append({"top": top, "icon": icon, "temp": temp, "x0": x0})
+
+    forecast_status = m5ui.M5Label("", x=12, y=170,
+                                    text_c=0x555555, bg_opa=0, font=font_tiny, parent=page1)
+
+    forecast_toggle_btn = m5ui.M5Button(text="Show Week", x=90, y=195, w=140, h=34,
+                                         bg_c=0x2980B9, text_c=0xFFFFFF,
+                                         font=font_tiny, parent=page1)
+    forecast_toggle_btn.add_event_cb(_on_forecast_toggle, lv.EVENT.CLICKED, None)
+
+
+def _build_voice_page(font_small, font_tiny, text_color, bg_color):
+    global page2, voice_btn_rec, voice_label_status, voice_label_reply, voice_spinner
+
+    page2 = m5ui.M5Page(bg_c=bg_color)
+    m5ui.M5Label("Ask Assistant", x=12, y=8, text_c=text_color, bg_opa=0, font=font_small, parent=page2)
+
+    voice_label_status = m5ui.M5Label("Ready", x=12, y=30, text_c=text_color, bg_opa=0, font=font_tiny, parent=page2)
     voice_label_status.set_size(300, 18)
 
-    voice_label_reply = m5ui.M5Label("", x=12, y=52, text_c=text_color, bg_opa=0, font=font_tiny, parent=page1)
+    voice_label_reply = m5ui.M5Label("", x=12, y=52, text_c=text_color, bg_opa=0, font=font_tiny, parent=page2)
     voice_label_reply.set_size(300, 100)
 
     if hasattr(m5ui, "M5Spinner"):
         voice_spinner = m5ui.M5Spinner(x=110, y=65, w=100, h=100, anim_t=10000, angle=180,
-                                        bg_c=0xE7E3E7, bg_c_indicator=0x2193F3, parent=page1)
+                                        bg_c=0xE7E3E7, bg_c_indicator=0x2193F3, parent=page2)
         voice_spinner.set_flag(lv.obj.FLAG.HIDDEN, True)
     else:
         voice_spinner = None
 
     voice_btn_rec = m5ui.M5Button(text="HOLD TO ASK", x=60, y=170, w=200, h=60,
-                                   bg_c=0xC0392B, text_c=0xFFFFFF, font=font_small, parent=page1)
+                                   bg_c=0xC0392B, text_c=0xFFFFFF, font=font_small, parent=page2)
     voice_btn_rec.add_event_cb(_on_voice_button_event, lv.EVENT.ALL, None)
 
     voice_client.prepare()
     voice_client.register_callbacks(_set_voice_status, _set_voice_reply, _show_voice_spinner)
 
 
-def _build_wifi_page(font_small, font_tiny, text_color, bg_color):
-    global page2, wifi_status_label, wifi_list, wifi_spinner
+def _make_qrcode(parent, size, x, y):
+    """Create an LVGL QR code widget. Wraps API differences across LVGL 8/9
+    builds; returns (widget, fallback_label). Exactly one of the two will be
+    non-None — the other is None. The fallback label is shown when no QR
+    constructor is available so the URL still reaches the user."""
+    # LVGL 9 style: lv.qrcode(parent), then size + colors via setters.
+    try:
+        QrCls = getattr(lv, "qrcode", None)
+        if QrCls is not None:
+            try:
+                qr = QrCls(parent)
+                try: qr.set_size(size)
+                except AttributeError: pass
+                try:
+                    qr.set_dark_color(lv.color_hex(0x000000))
+                    qr.set_light_color(lv.color_hex(0xFFFFFF))
+                except AttributeError:
+                    pass
+                qr.set_pos(x, y)
+                return qr, None
+            except TypeError:
+                # LVGL 8 style: lv.qrcode(parent, size, dark, light)
+                try:
+                    qr = QrCls(parent, size, lv.color_hex(0x000000), lv.color_hex(0xFFFFFF))
+                    qr.set_pos(x, y)
+                    return qr, None
+                except Exception as e:
+                    _ui_log("LVGL 8 qrcode ctor failed:", e)
+            except Exception as e:
+                _ui_log("LVGL 9 qrcode ctor failed:", e)
+    except Exception as e:
+        _ui_log("qrcode lookup raised:", e)
 
-    page2 = m5ui.M5Page(bg_c=bg_color)
-    m5ui.M5Label("Wi-Fi", x=12, y=8, text_c=text_color, bg_opa=0, font=font_small, parent=page2)
-
-    wifi_status_label = m5ui.M5Label("Status: ...", x=12, y=30, text_c=text_color, bg_opa=0, font=font_tiny, parent=page2)
-
-    scan_btn = m5ui.M5Button(text="Scan", x=210, y=6, w=45, h=28,
-                             bg_c=0x2980B9, text_c=0xFFFFFF, font=font_tiny, parent=page2)
-    scan_btn.add_event_cb(_on_scan_clicked, lv.EVENT.CLICKED, None)
-
-    forget_btn = m5ui.M5Button(text="Forget", x=260, y=6, w=55, h=28,
-                               bg_c=0xC0392B, text_c=0xFFFFFF, font=font_tiny, parent=page2)
-    forget_btn.add_event_cb(_on_forget_clicked, lv.EVENT.CLICKED, None)
-
-    wifi_list = m5ui.M5List(x=10, y=52, w=300, h=155, parent=page2)
-
-    m5ui.M5Label("Tap a network to connect", x=12, y=215,
-                 text_c=text_color, bg_opa=0, font=font_tiny, parent=page2)
-
-    if hasattr(m5ui, "M5Spinner"):
-        wifi_spinner = m5ui.M5Spinner(x=140, y=100, w=40, h=40, parent=page2)
-        wifi_spinner.set_flag(lv.obj.FLAG.HIDDEN, True)
-    else:
-        wifi_spinner = None
+    # Fallback: large URL label centred where the QR would have been.
+    label = m5ui.M5Label("(QR unavailable)", x=x, y=y + size // 2 - 8,
+                          text_c=0x000000, bg_opa=0, parent=parent)
+    return None, label
 
 
-def _build_password_page(font_small, font_tiny, text_color, bg_color):
-    global page3, pwd_ssid_label, pwd_textarea, pwd_status_label
+def _build_config_page(font_small, font_tiny, text_color, bg_color):
+    """Configuration page: QR code linking to the WifiManager2 HTTP form,
+    plus the AP SSID/password and URL in plain text. Replaces the old scan
+    list + on-screen keyboard."""
+    global page3, cfg_status_label, cfg_qr, cfg_qr_fallback_label
+    global cfg_ssid_label, cfg_url_label
 
     page3 = m5ui.M5Page(bg_c=bg_color)
 
-    pwd_ssid_label = m5ui.M5Label("", x=6, y=12, text_c=text_color, bg_opa=0, font=font_small, parent=page3)
-    pwd_ssid_label.set_size(108, 24)
+    m5ui.M5Label("Configuration", x=12, y=8, text_c=text_color, bg_opa=0,
+                 font=font_small, parent=page3)
+    cfg_status_label = m5ui.M5Label("Starting...", x=12, y=28,
+                                     text_c=0x555555, bg_opa=0, font=font_tiny, parent=page3)
 
-    pwd_textarea = m5ui.M5TextArea(x=120, y=4, w=196, h=32, placeholder="password", parent=page3)
-    try:
-        pwd_textarea.set_one_line(True)
-        pwd_textarea.set_password_mode(False)
-    except AttributeError:
-        pass
+    qr_size = 130
+    qr_x = (320 - qr_size) // 2
+    cfg_qr, cfg_qr_fallback_label = _make_qrcode(page3, size=qr_size, x=qr_x, y=50)
 
-    m5ui.M5Keyboard(x=0, y=40, w=320, h=170, target_textarea=pwd_textarea, parent=page3)
+    cfg_ssid_label = m5ui.M5Label("", x=12, y=188, text_c=text_color, bg_opa=0, font=font_tiny, parent=page3)
+    cfg_url_label  = m5ui.M5Label("", x=12, y=204, text_c=text_color, bg_opa=0, font=font_tiny, parent=page3)
 
-    cancel_btn = m5ui.M5Button(text="Cancel", x=4, y=212, w=96, h=26,
-                               bg_c=0x7F8C8D, text_c=0xFFFFFF, font=font_tiny, parent=page3)
-    cancel_btn.add_event_cb(_on_cancel_clicked, lv.EVENT.CLICKED, None)
 
-    connect_btn = m5ui.M5Button(text="Connect", x=220, y=212, w=96, h=26,
-                                bg_c=0x27AE60, text_c=0xFFFFFF, font=font_tiny, parent=page3)
-    connect_btn.add_event_cb(_on_connect_clicked, lv.EVENT.CLICKED, None)
-
-    pwd_status_label = m5ui.M5Label("", x=106, y=218, text_c=0xC0392B, bg_opa=0, font=font_tiny, parent=page3)
-
+def _set_qr(text):
+    """Update the QR widget (or the text fallback) with a new URL."""
+    if cfg_qr is not None:
+        try:
+            try:
+                cfg_qr.update(text, len(text))
+            except TypeError:
+                # Some bindings expect bytes
+                buf = text.encode("utf-8")
+                cfg_qr.update(buf, len(buf))
+            return
+        except Exception as e:
+            _ui_log("qr update failed:", e)
+    if cfg_qr_fallback_label is not None:
+        try:
+            cfg_qr_fallback_label.set_text(text)
+        except Exception as e:
+            _ui_log("qr fallback set_text failed:", e)
 
 
 def init(wlan_sta):
@@ -208,9 +309,9 @@ def init(wlan_sta):
     bg_color = 0xD1D1D1
 
     _build_dashboard_page(font_big, font_small, font_tiny, text_color, bg_color)
+    _build_forecast_page(font_small, font_tiny, text_color, bg_color)
     _build_voice_page(font_small, font_tiny, text_color, bg_color)
-    _build_wifi_page(font_small, font_tiny, text_color, bg_color)
-    _build_password_page(font_small, font_tiny, text_color, bg_color)
+    _build_config_page(font_small, font_tiny, text_color, bg_color)
 
     page0.screen_load()
 
@@ -257,16 +358,145 @@ def update_clock():
 
 
 def refresh_wifi_indicator():
+    """Recolour the dashboard Wi-Fi icon based on the STA association.
+    Status text on the config page is driven by WifiManager callbacks
+    (set_config_status_*) — this function only owns the icon."""
     try:
         if _wlan_sta is not None and _wlan_sta.isconnected():
-            ssid = wifi_manager.current_ssid(_wlan_sta) or "connected"
             wifi_ind.set_text_color(0x2ECC71, 255, lv.PART.MAIN)
-            wifi_status_label.set_text("Status: connected to " + ssid)
         else:
             wifi_ind.set_text_color(0xE74C3C, 255, lv.PART.MAIN)
-            wifi_status_label.set_text("Status: disconnected")
     except Exception as e:
         _ui_log("refresh_wifi_indicator error:", e)
+
+
+# ----------------------------------------------------------------------------
+# Forecast page setters / event handlers
+# ----------------------------------------------------------------------------
+
+def is_forecast_active():
+    return current_page == 1
+
+
+def _format_temp(value):
+    if value is None:
+        return "--"
+    return "{}°".format(int(round(value)))
+
+
+def _set_slot_icon(slot, code):
+    """Replace the slot's icon by setting its src. The widget is the same
+    instance so layout stays stable; only the bitmap source changes."""
+    try:
+        if slot["icon"] is None:
+            slot["icon"] = _make_image(page1, forecast_mod.icon_path(code),
+                                        x=slot["x0"] + 4, y=72)
+            return
+        slot["icon"].set_src(forecast_mod.icon_path(code))
+    except Exception as e:
+        _ui_log("set_slot_icon err:", e)
+
+
+def _hide_extra_slots(used_count):
+    for i, slot in enumerate(forecast_slots):
+        hidden = i >= used_count
+        try:
+            slot["top"].set_flag(lv.obj.FLAG.HIDDEN, hidden)
+            if slot["icon"] is not None:
+                slot["icon"].set_flag(lv.obj.FLAG.HIDDEN, hidden)
+            slot["temp"].set_flag(lv.obj.FLAG.HIDDEN, hidden)
+        except Exception:
+            pass
+
+
+def _render_today():
+    buckets = forecast_mod.today_buckets(_forecast_data, max_slots=FORECAST_SLOTS)
+    if not buckets:
+        forecast_status.set_text("No forecast data yet")
+        _hide_extra_slots(0)
+        return
+    forecast_status.set_text("")
+    for i, slot in enumerate(forecast_slots):
+        if i < len(buckets):
+            b = buckets[i]
+            slot["top"].set_text("{:02d}:00".format(b["hour"]))
+            _set_slot_icon(slot, b["icon"])
+            slot["temp"].set_text(_format_temp(b["temp"]))
+    _hide_extra_slots(len(buckets))
+
+
+def _render_week():
+    days = forecast_mod.week_days(_forecast_data, max_days=FORECAST_SLOTS)
+    if not days:
+        forecast_status.set_text("No forecast data yet")
+        _hide_extra_slots(0)
+        return
+    forecast_status.set_text("")
+    for i, slot in enumerate(forecast_slots):
+        if i < len(days):
+            d = days[i]
+            slot["top"].set_text(d["day_name"])
+            _set_slot_icon(slot, d["icon"])
+            slot["temp"].set_text("{}/{}".format(
+                _format_temp(d["temp_min"]), _format_temp(d["temp_max"])
+            ))
+    _hide_extra_slots(len(days))
+
+
+def _render_forecast():
+    if _forecast_view == "week":
+        forecast_title.set_text("Forecast - 5 days")
+        forecast_subtitle.set_text("min / max")
+        forecast_toggle_label_text("Show Today")
+        _render_week()
+    else:
+        forecast_title.set_text("Forecast - Today")
+        forecast_subtitle.set_text("next hours")
+        forecast_toggle_label_text("Show Week")
+        _render_today()
+
+
+def forecast_toggle_label_text(text):
+    """Set the toggle button label. Wraps a few API differences across m5ui
+    versions (some expose set_text on the button itself, others on a child)."""
+    try:
+        forecast_toggle_btn.set_text(text)
+    except AttributeError:
+        try:
+            forecast_toggle_btn.set_label_text(text)
+        except Exception:
+            pass
+
+
+def _on_forecast_toggle(event_struct):
+    global _forecast_view
+    _forecast_view = "week" if _forecast_view == "today" else "today"
+    _render_forecast()
+
+
+def update_forecast(data):
+    """Called from main.py after a successful forecast.fetch(). Stores the
+    raw data and re-renders if the user is currently looking at this page."""
+    global _forecast_data
+    _forecast_data = data
+    if data is None:
+        forecast_status.set_text("Forecast unavailable")
+        return
+    if is_forecast_active():
+        _render_forecast()
+
+
+def forecast_show_loading():
+    forecast_status.set_text("Loading forecast...")
+
+
+def forecast_is_fetching():
+    return _forecast_fetching
+
+
+def set_forecast_fetching(val):
+    global _forecast_fetching
+    _forecast_fetching = bool(val)
 
 
 # ----------------------------------------------------------------------------
@@ -279,6 +509,10 @@ def refresh_page():
         page0.screen_load()
     elif current_page == 1:
         page1.screen_load()
+        # Re-render with whatever data we currently have so the page never
+        # looks blank when the user lands on it after a refresh elsewhere.
+        if _forecast_data is not None:
+            _render_forecast()
     elif current_page == 2:
         page2.screen_load()
     elif current_page == 3:
@@ -287,18 +521,19 @@ def refresh_page():
 
 def go_next_page():
     global current_page
-    # Btn-driven nav: dashboard (0) -> voice (1) -> wifi (2). Password (3)
-    # is reached only by tapping a network on the wifi page.
-    if current_page >= 2:
+    # Btn-driven nav: dashboard (0) -> forecast (1) -> voice (2) -> config (3).
+    if current_page >= 3:
         return
     if voice_client.is_busy():
-        # Don't yank the user off the voice page mid-recording / mid-reply.
         return
+    prev = current_page
     current_page += 1
     refresh_page()
-    if current_page == 2 and not _network_click_handlers:
-        _ui_log("entered wifi page, auto-scanning")
-        trigger_scan()
+    if _page_change_hook is not None:
+        try:
+            _page_change_hook(prev, current_page)
+        except Exception as e:
+            _ui_log("page hook error:", e)
 
 
 def go_prev_page():
@@ -307,84 +542,78 @@ def go_prev_page():
         return
     if voice_client.is_busy():
         return
+    prev = current_page
     current_page -= 1
     refresh_page()
+    if _page_change_hook is not None:
+        try:
+            _page_change_hook(prev, current_page)
+        except Exception as e:
+            _ui_log("page hook error:", e)
+
+
+def go_to_page(n):
+    """Programmatic navigation, used by main.py to jump to page 3 on boot
+    when STA fails. Bypasses the voice_client busy check because it's
+    invoked outside human nav."""
+    global current_page
+    if not 0 <= n <= 3 or n == current_page:
+        return
+    prev = current_page
+    current_page = n
+    refresh_page()
+    if _page_change_hook is not None:
+        try:
+            _page_change_hook(prev, current_page)
+        except Exception as e:
+            _ui_log("page hook error:", e)
 
 
 def get_current_page():
     return current_page
 
 
-def _go_to_password_page(ssid):
-    global current_page, _pending_ssid
-    _ui_log("_go_to_password_page(", ssid, ")")
-    _pending_ssid = ssid
-    display = ssid if len(ssid) <= 11 else ssid[:10] + "…"
-    pwd_ssid_label.set_text(display)
-    saved = wifi_manager.load_credentials().get(ssid, "")
-    pwd_textarea.set_text(saved)
-    pwd_status_label.set_text("")
-    current_page = 3
-    refresh_page()
-
-
-def _back_to_wifi_page():
-    global current_page, _pending_ssid
-    _pending_ssid = None
-    pwd_textarea.set_text("")
-    pwd_status_label.set_text("")
-    current_page = 2
-    refresh_page()
+def is_dashboard_active():
+    """True when page 0 is on screen — used by main.py to skip work whose
+    only output is dashboard widgets (clock, sensor labels, Wi-Fi icon)."""
+    return current_page == 0
 
 
 # ----------------------------------------------------------------------------
-# Wi-Fi list
+# Configuration page setters (called from main._on_wifi_event)
 # ----------------------------------------------------------------------------
 
-def _rssi_to_bars(rssi):
-    if rssi >= -55: return "||||"
-    if rssi >= -65: return "|||."
-    if rssi >= -75: return "||.."
-    if rssi >= -85: return "|..."
-    return "...."
-
-
-def _make_network_click_handler(ssid):
-    # Closure binds ssid per-row. Avoids the LVGL-MicroPython gotcha where
-    # event_struct.get_target_obj() returns a different Python wrapper than
-    # M5List.add_button() did, so id()-based lookup fails.
-    def handler(event_struct):
-        _ui_log("network clicked:", ssid)
-        _go_to_password_page(ssid)
-    return handler
-
-
-def _populate_wifi_list(networks):
-    global _network_click_handlers
-
+def set_config_status_ap(info):
+    """Render the AP-mode UI: red status, QR + visible AP credentials."""
     try:
-        wifi_list.clean()
-    except AttributeError:
-        child = wifi_list.get_child(0)
-        while child is not None:
-            child.delete()
-            child = wifi_list.get_child(0)
-    _network_click_handlers = []
+        cfg_status_label.set_text("AP mode - connect to set up Wi-Fi")
+        cfg_status_label.set_text_color(0xC0392B, 255, lv.PART.MAIN)
+        _set_qr(info["url"])
+        cfg_ssid_label.set_text("Wi-Fi: " + info.get("essid", ""))
+        cfg_url_label.set_text(info.get("url", ""))
+    except Exception as e:
+        _ui_log("set_config_status_ap error:", e)
 
-    if not networks:
-        wifi_list.add_text("No networks found. Tap Scan to retry.")
-        return
 
-    known = set(wifi_manager.known_ssids())
-    for ssid, rssi, is_secure in networks:
-        bars = _rssi_to_bars(rssi)
-        lock = " " + lv.SYMBOL.EYE_CLOSE if is_secure else ""
-        saved = " *" if ssid in known else ""
-        label = "{}  {}{}{}".format(bars, ssid, lock, saved)
-        btn = wifi_list.add_button(lv.SYMBOL.WIFI, text=label, h=34)
-        handler = _make_network_click_handler(ssid)
-        _network_click_handlers.append(handler)  # keep alive against GC
-        btn.add_event_cb(handler, lv.EVENT.CLICKED, None)
+def set_config_status_connected(ssid, ip, url):
+    """Render the connected-mode UI: green status, QR points to the device IP
+    so the same web form is reachable from a phone on the same LAN."""
+    try:
+        cfg_status_label.set_text("Connected - " + ssid)
+        cfg_status_label.set_text_color(0x27AE60, 255, lv.PART.MAIN)
+        _set_qr(url)
+        cfg_ssid_label.set_text("IP: " + ip)
+        cfg_url_label.set_text(url)
+    except Exception as e:
+        _ui_log("set_config_status_connected error:", e)
+
+
+def set_config_status_disconnected():
+    try:
+        cfg_status_label.set_text("Disconnected - searching...")
+        cfg_status_label.set_text_color(0xE67E22, 255, lv.PART.MAIN)
+    except Exception as e:
+        _ui_log("set_config_status_disconnected error:", e)
 
 
 # ----------------------------------------------------------------------------
@@ -420,7 +649,6 @@ def _set_voice_status(text):
 
 def _set_voice_reply(text):
     try:
-        # crude line wrap so long replies stay on screen
         chunks = [text[i:i + 40] for i in range(0, len(text), 40)] or [""]
         voice_label_reply.set_text("\n".join(chunks[:5]))
     except Exception as e:
@@ -433,110 +661,3 @@ def _show_voice_spinner(visible):
             voice_spinner.set_flag(lv.obj.FLAG.HIDDEN, not visible)
     except Exception as e:
         _ui_log("voice spinner err:", e)
-
-
-def _on_scan_clicked(event_struct):
-    trigger_scan()
-
-
-def _on_forget_clicked(event_struct):
-    ssid = wifi_manager.current_ssid(_wlan_sta)
-    if not ssid:
-        wifi_status_label.set_text("Status: nothing to forget")
-        return
-    wifi_manager.forget_credential(ssid)
-    try:
-        _wlan_sta.disconnect()
-    except Exception as e:
-        _ui_log("disconnect raised:", e)
-    refresh_wifi_indicator()
-    trigger_scan()
-
-
-def _on_connect_clicked(event_struct):
-    global is_connecting
-    if is_connecting or _pending_ssid is None:
-        return
-    password = pwd_textarea.get_text() or ""
-    pwd_status_label.set_text("Connecting...")
-    pwd_status_label.set_text_color(0x555555, 255, lv.PART.MAIN)
-    is_connecting = True
-    _thread.start_new_thread(_connect_thread, (_pending_ssid, password))
-
-
-def _on_cancel_clicked(event_struct):
-    _back_to_wifi_page()
-
-
-# ----------------------------------------------------------------------------
-# Wi-Fi worker threads
-# ----------------------------------------------------------------------------
-
-def trigger_scan():
-    global is_scanning
-    if is_scanning:
-        return
-    is_scanning = True
-    wifi_status_label.set_text("Status: scanning...")
-    if wifi_spinner is not None:
-        wifi_spinner.set_flag(lv.obj.FLAG.HIDDEN, False)
-    _thread.start_new_thread(_scan_thread, ())
-
-
-def _scan_thread():
-    global is_scanning
-    try:
-        networks = wifi_manager.scan_networks(_wlan_sta)
-        _populate_wifi_list(networks)
-        wifi_status_label.set_text("Status: {} networks".format(len(networks)))
-    except Exception as e:
-        _ui_log("_scan_thread error:", type(e).__name__, e)
-        try:
-            sys.print_exception(e)
-        except Exception:
-            pass
-        wifi_status_label.set_text("Status: scan error")
-    finally:
-        if wifi_spinner is not None:
-            wifi_spinner.set_flag(lv.obj.FLAG.HIDDEN, True)
-        is_scanning = False
-        refresh_wifi_indicator()
-
-
-def _connect_thread(ssid, password):
-    global is_connecting
-    try:
-        ok = wifi_manager.connect_to(_wlan_sta, ssid, password, timeout_ms=15000)
-        if ok:
-            wifi_manager.add_credential(ssid, password)
-            pwd_status_label.set_text("Connected")
-            pwd_status_label.set_text_color(0x27AE60, 255, lv.PART.MAIN)
-            time.sleep(1)
-            _back_to_wifi_page()
-        else:
-            pwd_status_label.set_text("Failed. Check password.")
-            pwd_status_label.set_text_color(0xC0392B, 255, lv.PART.MAIN)
-    except Exception as e:
-        _ui_log("_connect_thread error:", type(e).__name__, e)
-        try:
-            sys.print_exception(e)
-        except Exception:
-            pass
-        pwd_status_label.set_text("Error: " + str(e)[:20])
-        pwd_status_label.set_text_color(0xC0392B, 255, lv.PART.MAIN)
-    finally:
-        is_connecting = False
-        refresh_wifi_indicator()
-
-
-def start_boot_autoconnect():
-    _thread.start_new_thread(_boot_autoconnect_thread, ())
-
-
-def _boot_autoconnect_thread():
-    try:
-        wifi_manager.autoconnect(_wlan_sta, timeout_ms=10000)
-    except Exception as e:
-        _ui_log("_boot_autoconnect_thread error:", e)
-    refresh_wifi_indicator()
-

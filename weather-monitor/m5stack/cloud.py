@@ -2,6 +2,7 @@ import time
 import json
 import requests2
 
+import led
 from api_func import get_location_from_ip, IPDATA_KEY
 
 BIGQUERY_URL = 'https://flask-app-868833155300.europe-west6.run.app/send-to-bigquery'
@@ -41,17 +42,26 @@ def send_data(temperature, humidity, co2, location, on_done):
         }
 
         try:
+            # 5 rapid green blinks signal "upload in progress" before we
+            # block on the HTTP round-trip.
+            led.flash_sending()
             # 4. Use `data=utf8_payload` instead of `json=payload`
             resp = requests2.post(
-                BIGQUERY_URL, 
-                data=utf8_payload, 
-                headers=headers, 
+                BIGQUERY_URL,
+                data=utf8_payload,
+                headers=headers,
                 timeout=HTTP_TIMEOUT_S
             )
-            print("Network Status:", resp.status_code)
+            status = resp.status_code
+            print("Network Status:", status)
             resp.close()
+            if status == 200:
+                led.flash_success()
+            else:
+                led.flash_error()
         except Exception as e:
             print("Network error:", e)
+            led.flash_error()
     finally:
         on_done()
 
