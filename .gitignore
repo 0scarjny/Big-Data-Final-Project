@@ -1,2 +1,5 @@
 .env
 weather-monitor/test/
+weather-monitor/Flask/src/__pycache__/
+weather-monitor/m5stack/images/
+weather-monitor/m5stack/res/img/
