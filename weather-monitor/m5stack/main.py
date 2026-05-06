@@ -43,7 +43,10 @@ _ap_mode_active = False
 _location_fetch_started = False
 _ntp_synced = False
 
-_NTP_SERVERS = ('ntp.aliyun.com', 'jp.pool.ntp.org', 'pool.ntp.org')
+# European servers first — closest to Switzerland; generic pool as fallback.
+_NTP_SERVERS = ('ch.pool.ntp.org', 'europe.pool.ntp.org', 'pool.ntp.org', 'ntp.aliyun.com')
+_NTP_RETRIES = 3       # rounds over the server list before giving up
+_NTP_RETRY_DELAY_S = 5 # seconds between retry rounds
 
 
 def is_ap_mode():
@@ -120,18 +123,30 @@ def _on_page_change(prev, now):
 
 
 def _ntp_sync_thread():
-    """Try each NTP server in order and set the RTC to UTC on first success."""
+    """Try each NTP server in order, retrying across multiple rounds.
+
+    A short initial delay lets the AP radio finish tearing down and the
+    network stack fully stabilise before the first UDP packet is sent —
+    otherwise the very first attempt races the post-boot AP disable and
+    times out even on a healthy connection."""
     global _ntp_synced
-    for host in _NTP_SERVERS:
-        try:
-            ntptime.host = host
-            ntptime.settime()  # sets RTC to UTC
-            _ntp_synced = True
-            print("[ntp] synced via", host)
-            return
-        except Exception as e:
-            print("[ntp] {} failed: {}".format(host, e))
-    print("[ntp] all servers failed, clock may be inaccurate")
+    import time as _time
+    _time.sleep(3)  # wait for AP teardown + routing table to settle
+    for attempt in range(1, _NTP_RETRIES + 1):
+        for host in _NTP_SERVERS:
+            try:
+                ntptime.host = host
+                ntptime.settime()  # sets RTC to UTC
+                _ntp_synced = True
+                print("[ntp] synced via", host)
+                return
+            except Exception as e:
+                print("[ntp] {} failed: {}".format(host, e))
+        if attempt < _NTP_RETRIES:
+            print("[ntp] round {}/{} failed, retrying in {}s".format(
+                attempt, _NTP_RETRIES, _NTP_RETRY_DELAY_S))
+            _time.sleep(_NTP_RETRY_DELAY_S)
+    print("[ntp] all servers failed after {} rounds".format(_NTP_RETRIES))
 
 
 def _on_wifi_event(event, **kw):

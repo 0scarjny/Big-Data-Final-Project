@@ -14,7 +14,7 @@ import requests2
 
 FORECAST_URL = 'https://flask-app-868833155300.europe-west6.run.app/get_forecast'
 SHARED_SECRET = '03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4'
-HTTP_TIMEOUT_S = 15
+HTTP_TIMEOUT_S = 25  # Cloud Run cold starts can take 15-20 s
 
 DEFAULT_CITY = "Lausanne"
 
@@ -77,22 +77,24 @@ def _local_struct(ts_utc, tz_offset_s):
 
 
 def today_buckets(data, max_slots=6):
-    """List of dicts: {hour, icon, temp, description} for today's remaining
-    3-hour buckets, capped at max_slots."""
+    """List of the next max_slots upcoming 3-hour forecast slots.
+
+    Takes the next N entries from the forecast list that have not yet passed,
+    regardless of day boundary.  This means late in the day the view
+    seamlessly shows tomorrow's slots without any special-casing, and any
+    API update is fully reflected on the next refresh.  Each entry:
+    {hour, icon, temp, description}.
+    """
     if not data:
         return []
     tz = (data.get("city") or {}).get("timezone", 0)
     now = time.time()
     out = []
-    today_yday = _local_struct(int(now), tz)[7]  # day-of-year for "today"
-
     for item in data.get("list", []):
         dt = item.get("dt", 0)
-        if dt < now - 600:  # skip already-past slots (with 10 min grace)
+        if dt < now - 600:  # skip already-past slots (10 min grace)
             continue
         local = _local_struct(dt, tz)
-        if local[7] != today_yday:
-            break  # next day; stop
         weather = (item.get("weather") or [{}])[0]
         main = item.get("main") or {}
         out.append({
@@ -103,26 +105,6 @@ def today_buckets(data, max_slots=6):
         })
         if len(out) >= max_slots:
             break
-
-    # Edge case: if "today" is nearly over there might be 0–1 slots left.
-    # Fall back to the next available slots so the view never goes empty.
-    if len(out) < 2:
-        out = []
-        for item in data.get("list", []):
-            dt = item.get("dt", 0)
-            if dt < now - 600:
-                continue
-            local = _local_struct(dt, tz)
-            weather = (item.get("weather") or [{}])[0]
-            main = item.get("main") or {}
-            out.append({
-                "hour": local[3],
-                "icon": weather.get("icon") or "01d",
-                "temp": main.get("temp"),
-                "description": weather.get("description") or "",
-            })
-            if len(out) >= max_slots:
-                break
     return out
 
 
