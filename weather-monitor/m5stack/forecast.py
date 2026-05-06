@@ -140,8 +140,33 @@ def week_days(data, max_days=5):
     return out
 
 
-def icon_path(code):
-    """Filesystem path on the device for a given OpenWeather icon code."""
-    if not code:
-        code = "01d"
-    return "S:/flash/res/img/weather/{}.png".format(code)
+# OpenWeather icon code -> codepoint in the Erik Flowers Weather Icons font.
+# Cross-reference with weather-icons/css/weather-icons.css when adjusting.
+# The font must be converted to LVGL .bin and placed at
+# S:/flash/res/font/weather_icons_<size>.bin (see init() in ui.py).
+_OWM_TO_CODEPOINT = {
+    "01d": 0xF00D,  # wi-day-sunny
+    "01n": 0xF02E,  # wi-night-clear
+    "02d": 0xF002,  # wi-day-cloudy
+    "02n": 0xF086,  # wi-night-alt-cloudy
+    "03d": 0xF041,  # wi-cloud
+    "03n": 0xF041,
+    "04d": 0xF013,  # wi-cloudy
+    "04n": 0xF013,
+    "09d": 0xF009,  # wi-day-showers
+    "09n": 0xF029,  # wi-night-alt-showers
+    "10d": 0xF008,  # wi-day-rain
+    "10n": 0xF028,  # wi-night-alt-rain
+    "11d": 0xF010,  # wi-day-thunderstorm
+    "11n": 0xF02D,  # wi-night-alt-thunderstorm
+    "13d": 0xF00A,  # wi-day-snow
+    "13n": 0xF02A,  # wi-night-alt-snow
+    "50d": 0xF014,  # wi-fog
+    "50n": 0xF014,
+}
+
+
+def icon_glyph(code):
+    """Return the weather-icons glyph (single char) for an OpenWeather code."""
+    cp = _OWM_TO_CODEPOINT.get(code or "01d", _OWM_TO_CODEPOINT["01d"])
+    return chr(cp)

@@ -82,27 +82,6 @@ def safe_font(size):
     return getattr(lv, name, lv.font_montserrat_14)
 
 
-def _make_image(parent, src, x, y):
-    """Best-effort image factory. m5ui exposes M5Image on most firmware
-    builds; older ones only have raw lv.image. Returns the LVGL object on
-    success, None on failure (file missing / decoder unavailable)."""
-    try:
-        if hasattr(m5ui, "M5Image"):
-            img = m5ui.M5Image(src, x=x, y=y, parent=parent)
-            return img
-        # Fallback to raw LVGL.
-        ImgCls = getattr(lv, "image", None) or getattr(lv, "img", None)
-        if ImgCls is None:
-            return None
-        img = ImgCls(parent)
-        img.set_src(src)
-        img.set_pos(x, y)
-        return img
-    except Exception as e:
-        _ui_log("M5Image failed for", src, "->", e)
-        return None
-
-
 # ----------------------------------------------------------------------------
 # Page builders
 # ----------------------------------------------------------------------------
@@ -143,10 +122,14 @@ def _build_dashboard_page(font_large, font_small, font_tiny, text_color, bg_colo
     location_label = m5ui.M5Label("", x=130, y=218, text_c=text_color, bg_opa=0, font=font_small, parent=page0)
 
 
-def _build_forecast_page(font_small, font_tiny, text_color, bg_color):
+def _build_forecast_page(font_small, font_tiny, font_weather, text_color, bg_color):
     """Forecast page: title at top, 5 slots in the middle (icon + label +
     temp), and a centered toggle button at the bottom that flips between
-    'Today' (next 5 three-hour buckets) and 'Week' (5-day summary)."""
+    'Today' (next 5 three-hour buckets) and 'Week' (5-day summary).
+
+    Icons render as glyphs from the Erik Flowers Weather Icons font (loaded
+    in init() as font_weather). When the font fails to load, the slot's
+    icon is None and the icon row stays blank — labels still render."""
     global page1, forecast_title, forecast_subtitle
     global forecast_toggle_btn, forecast_toggle_label, forecast_status, forecast_slots
 
@@ -165,9 +148,14 @@ def _build_forecast_page(font_small, font_tiny, text_color, bg_color):
         x0 = margin + i * slot_w
         top = m5ui.M5Label("", x=x0 + 16, y=52,
                             text_c=text_color, bg_opa=0, font=font_tiny, parent=page1)
-        # Icon placeholder; real source filled in by render functions.
-        icon = _make_image(page1, forecast_mod.icon_path("01d"), x=x0 + 4, y=72)
-        temp = m5ui.M5Label("--", x=x0 + 14, y=136,
+        if font_weather is not None:
+            icon = m5ui.M5Label(forecast_mod.icon_glyph("01d"),
+                                 x=x0 + 8, y=72,
+                                 text_c=text_color, bg_opa=0,
+                                 font=font_weather, parent=page1)
+        else:
+            icon = None
+        temp = m5ui.M5Label("--", x=x0 + 14, y=144,
                              text_c=text_color, bg_opa=0, font=font_tiny, parent=page1)
         forecast_slots.append({"top": top, "icon": icon, "temp": temp, "x0": x0})
 
@@ -305,11 +293,20 @@ def init(wlan_sta):
         font_big = font_large
     globals()["_font_big_ref"] = font_big
 
+    try:
+        font_weather = lv.binfont_create("S:/flash/res/font/weather_icons_48.bin")
+        if font_weather is None:
+            raise OSError("binfont_create returned None")
+    except Exception as e:
+        print("Weather icon font load failed, falling back:", e)
+        font_weather = None
+    globals()["_font_weather_ref"] = font_weather
+
     text_color = 0x000000
     bg_color = 0xD1D1D1
 
     _build_dashboard_page(font_big, font_small, font_tiny, text_color, bg_color)
-    _build_forecast_page(font_small, font_tiny, text_color, bg_color)
+    _build_forecast_page(font_small, font_tiny, font_weather, text_color, bg_color)
     _build_voice_page(font_small, font_tiny, text_color, bg_color)
     _build_config_page(font_small, font_tiny, text_color, bg_color)
 
@@ -385,14 +382,13 @@ def _format_temp(value):
 
 
 def _set_slot_icon(slot, code):
-    """Replace the slot's icon by setting its src. The widget is the same
-    instance so layout stays stable; only the bitmap source changes."""
+    """Replace the slot's icon glyph. The label is the same instance so
+    layout stays stable; only the displayed character changes."""
+    icon = slot.get("icon")
+    if icon is None:
+        return
     try:
-        if slot["icon"] is None:
-            slot["icon"] = _make_image(page1, forecast_mod.icon_path(code),
-                                        x=slot["x0"] + 4, y=72)
-            return
-        slot["icon"].set_src(forecast_mod.icon_path(code))
+        icon.set_text(forecast_mod.icon_glyph(code))
     except Exception as e:
         _ui_log("set_slot_icon err:", e)
 
