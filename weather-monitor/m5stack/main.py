@@ -312,19 +312,8 @@ async def sensor_task():
 async def forecast_task():
     """Refresh the forecast every FORECAST_REFRESH_S. First fetch waits for
     Wi-Fi to come up. Each fetch runs in a worker thread so HTTP doesn't
-    stall the asyncio loop.
-
-    On boot, any cached forecast from the previous session is shown
-    immediately so the page is never blank while waiting for the first
-    HTTP round-trip to the backend."""
-    # Show cached data from the previous boot immediately — the page is
-    # usable right away while the fresh fetch runs in the background.
-    cached = forecast.load_cache()
-    if cached is not None:
-        print("[forecast] loaded cache from flash")
-        ui.update_forecast(cached)
-    else:
-        ui.forecast_show_loading()
+    stall the asyncio loop."""
+    ui.forecast_show_loading()
 
     # Wait for Wi-Fi before the first live fetch.
     for _ in range(60):  # up to ~60 s

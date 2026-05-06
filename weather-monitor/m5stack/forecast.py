@@ -9,7 +9,6 @@
 # main.py's forecast_task) so the asyncio loop is never blocked.
 
 import time
-import json
 import requests2
 
 FORECAST_URL = 'https://flask-app-868833155300.europe-west6.run.app/get_forecast'
@@ -18,32 +17,11 @@ HTTP_TIMEOUT_S = 25  # Cloud Run cold starts can take 15-20 s
 
 DEFAULT_CITY = "Lausanne"
 
-CACHE_FILE = 'forecast_cache.json'
-
 DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
-def load_cache():
-    """Return the last successfully fetched forecast from flash, or None."""
-    try:
-        with open(CACHE_FILE, 'r') as f:
-            return json.loads(f.read())
-    except (OSError, ValueError):
-        return None
-
-
-def _save_cache(data):
-    try:
-        with open(CACHE_FILE, 'w') as f:
-            f.write(json.dumps(data))
-    except Exception as e:
-        print("[forecast] cache write error:", e)
-
-
 def fetch(city=None):
-    """Fetch the raw forecast JSON. Returns dict on success, None on failure.
-    On success, writes the result to CACHE_FILE so the next boot can show
-    stale data immediately while the fresh fetch runs in the background."""
+    """Fetch the raw forecast JSON. Returns dict on success, None on failure."""
     city = city or DEFAULT_CITY
     payload = {"passwd": SHARED_SECRET, "city": city}
     try:
@@ -57,10 +35,7 @@ def fetch(city=None):
         if data.get("status") != "success":
             print("[forecast] backend error:", data.get("error"))
             return None
-        result = data.get("data") or None
-        if result is not None:
-            _save_cache(result)
-        return result
+        return data.get("data") or None
     except Exception as e:
         print("[forecast] fetch error:", e)
         return None
