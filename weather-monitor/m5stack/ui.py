@@ -134,6 +134,7 @@ def _build_forecast_page(font_small, font_tiny, font_weather, text_color, bg_col
     global forecast_toggle_btn, forecast_toggle_label, forecast_status, forecast_slots
 
     page1 = m5ui.M5Page(bg_c=bg_color)
+    page1.set_flag(lv.obj.FLAG.SCROLLABLE, False)
 
     forecast_title = m5ui.M5Label("Forecast — Today", x=12, y=8,
                                    text_c=text_color, bg_opa=0, font=font_small, parent=page1)
