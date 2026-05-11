@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import streamlit as st
 
+from auth import logout_sidebar, require_login
 from views import about, indoor, outdoor, overview
 
 
@@ -13,6 +14,9 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Gate everything below. Stops execution if the user is not authenticated.
+require_login()
+
 
 pages = [
     st.Page(overview.overview_page, title="Overview",             icon=":material/home:", default=True),
@@ -21,4 +25,6 @@ pages = [
     st.Page(about.about_page,       title="About",                icon=":material/info:"),
 ]
 
-st.navigation(pages).run()
+navigation = st.navigation(pages)
+logout_sidebar()
+navigation.run()

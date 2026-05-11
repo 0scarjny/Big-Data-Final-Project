@@ -1,8 +1,16 @@
 services:
   flask:
-    build: 
+    build:
       dockerfile: Dockerfile
     ports:
       - "8080:8080"
     env_file:
       - ../../.env
+    volumes:
+      - ./src:/app/src
+    command: ["python", "-m", "flask", "--app", "src.main", "run", "--host=0.0.0.0", "--port=8080", "--debug"]
+
+# First time / when requirements.txt changes:
+#   docker-compose up --build
+# Otherwise (code edits auto-reload with --debug):
+#   docker-compose up

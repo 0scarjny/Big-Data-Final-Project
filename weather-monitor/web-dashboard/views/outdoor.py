@@ -1,10 +1,14 @@
 """Outdoor / comparison page — indoor-vs-outdoor charts + heatmap + weather mix."""
 from __future__ import annotations
 
+from datetime import date
+
 import streamlit as st
 
 from components import charts, filters
 from data import bigquery_client
+
+_DATE_RANGE_KEY = "outdoor_date_range"
 
 
 def outdoor_page() -> None:
@@ -14,6 +18,15 @@ def outdoor_page() -> None:
 
     with st.sidebar:
         st.header("Filters")
+
+        # Quick preset: jump to a single-day window (most recent date with data).
+        # Setting session_state BEFORE the date_input renders means the widget
+        # will use this value instead of its previous selection.
+        if st.button("Last 1 day", width='stretch'):
+            _, max_d = bigquery_client.fetch_available_date_range()
+            anchor = max_d or date.today()
+            st.session_state[_DATE_RANGE_KEY] = (anchor, anchor)
+
         start, end = filters.date_range_picker("outdoor", default_days=14)
         heatmap_metric_label = st.selectbox(
             "Heatmap metric",

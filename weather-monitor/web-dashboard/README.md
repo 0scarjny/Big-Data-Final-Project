@@ -43,6 +43,40 @@ web-dashboard/
 └── .dockerignore
 ```
 
+## Authentication (login gate)
+
+The dashboard is protected by [streamlit-authenticator](https://github.com/mkhorasani/Streamlit-Authenticator). Users are defined entirely in `.streamlit/secrets.toml` under `[auth]`:
+
+```toml
+[auth]
+enabled            = true
+cookie_name        = "weather_dashboard_auth"
+cookie_key         = "<long random string>"   # generate with `python -c "import secrets; print(secrets.token_urlsafe(48))"`
+cookie_expiry_days = 1
+auto_hash          = true                      # see "Pre-hashing passwords" below
+
+[auth.credentials.usernames.admin]
+email      = "admin@example.com"
+first_name = "Admin"
+last_name  = "User"
+password   = "change-me"
+roles      = ["admin"]
+```
+
+Add more users by repeating the `[auth.credentials.usernames.<name>]` block. To disable the gate entirely (e.g. behind a VPN), set `auth.enabled = false`.
+
+### Pre-hashing passwords
+
+With `auto_hash = true`, the library hashes the plaintext password in memory on each cold start. That's convenient but leaves the cleartext password on disk. For production:
+
+```bash
+python hash_password.py
+# Password to hash: ********
+# $2b$12$… (paste this into secrets.toml as the password value)
+```
+
+Then set `auto_hash = false`. The library will treat each `password` field as an already-bcrypt-hashed value.
+
 ## Configuration — environment / secrets
 
 Every project-specific value is resolved in this order: `st.secrets` →
