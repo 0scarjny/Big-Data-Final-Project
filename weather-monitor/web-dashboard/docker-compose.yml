@@ -1,0 +1,32 @@
+services:
+  dashboard:
+    build:
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount the secrets file so you don't need to bake credentials into the image.
+      - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
+      # Mount source directories for live reload during development.
+      - ./views:/app/views
+      - ./components:/app/components
+      - ./data:/app/data
+      - ./streamlit_app.py:/app/streamlit_app.py
+      - ./config.py:/app/config.py
+    command: >
+      streamlit run streamlit_app.py
+        --server.port=8080
+        --server.address=0.0.0.0
+        --server.headless=true
+        --server.runOnSave=true
+        --browser.gatherUsageStats=false
+
+# First time or when requirements.txt changes:
+#   docker compose up --build
+#
+# Subsequent runs (source changes reload automatically via --runOnSave):
+#   docker compose up
+#
+# Prerequisites:
+#   cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+#   # Fill in [gcp_service_account] and [app].flask_shared_secret
