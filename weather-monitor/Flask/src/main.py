@@ -153,6 +153,51 @@ def _bigquery_query():
     )
 
 
+@app.route("/recent-readings", methods=["GET"])
+def recent_readings():
+    """GET: return sensor readings from the last N hours.
+
+    Auth: header X-Shared-Secret OR query string ?passwd=<hash>.
+
+    Query parameters (all optional):
+      hours   int (1..168)  hours of history to return, default 24
+    """
+    passwd = request.headers.get("X-Shared-Secret") or request.args.get("passwd")
+    if passwd != PASSWORD_HASH:
+        return {"status": "failed", "error": "Incorrect Password!"}, 401
+
+    try:
+        hours = int(request.args.get("hours", 24))
+    except (TypeError, ValueError):
+        return {"status": "failed", "error": "hours must be an integer"}, 400
+    hours = max(1, min(hours, 168))
+
+    sql = f"""
+        SELECT *
+        FROM `{WEATHER_TABLE_PATH}`
+        WHERE PARSE_TIMESTAMP('%F %T', CONCAT(date, ' ', time))
+              >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @hours HOUR)
+        ORDER BY date DESC, time DESC
+    """
+    try:
+        job = client.query(
+            sql,
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ScalarQueryParameter("hours", "INT64", hours)]
+            ),
+        )
+        rows = [dict(r.items()) for r in job.result()]
+    except Exception as e:
+        log.error("recent-readings query failed: %s", e)
+        return {"status": "failed", "error": f"{type(e).__name__}: {e}"}, 500
+
+    return Response(
+        json.dumps({"status": "success", "count": len(rows), "hours": hours, "rows": rows},
+                   indent=2, sort_keys=True, default=str, ensure_ascii=False) + "\n",
+        mimetype="application/json",
+    )
+
+
 @app.route("/get_outdoor_weather", methods=["POST"])
 def get_outdoor_weather():
     payload = request.get_json(force=True)
