@@ -21,12 +21,24 @@ VOICE_URL = 'https://flask-app-868833155300.europe-west6.run.app/voice-assistant
 SHARED_SECRET = '03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4'
 HTTP_TIMEOUT_S = 30
 
+# Hard upper bound on how long playback may block before we give up on the
+# Speaker. Without this, a stuck Speaker.isPlaying() flag traps the worker
+# thread forever and the UI never recovers.
+MAX_PLAYBACK_S = 15
+
+# External watchdog: if _busy is still True this long after the worker thread
+# was spawned, the thread is presumed wedged (HTTP socket hung past its own
+# timeout, etc.). main.py polls watchdog_check() to force-reset the flag so a
+# new recording can be started. > HTTP_TIMEOUT_S + MAX_PLAYBACK_S.
+VOICE_WATCHDOG_MS = 45_000
+
 # --- Recording state ---
 _rec_data = None
 _recorded_bytes = 0
 _start_time = 0
 _recording = False
 _busy = False  # True from press until reply finished playing
+_thread_started_ms = 0  # ticks_ms() when the current worker thread was spawned
 
 # --- Device location (set by main.py once IP geolocation completes) ---
 # Sent as X-Device-Location with each request so the backend has a fallback
@@ -88,8 +100,20 @@ def _spinner(visible):
 
 def is_busy():
     """True while a recording or backend request is in flight. Used to block
-    button-press re-entry and physical-button page navigation."""
+    button-press re-entry and to defer the BigQuery upload one cycle."""
     return _busy or _recording
+
+
+def watchdog_check():
+    """Force-reset _busy if the worker thread has been alive longer than
+    VOICE_WATCHDOG_MS. MicroPython _thread has no cancel, so the orphan thread
+    keeps running until its socket fails — but the UI is no longer stuck."""
+    global _busy
+    if _busy and time.ticks_diff(time.ticks_ms(), _thread_started_ms) > VOICE_WATCHDOG_MS:
+        print("[voice] watchdog: forcing _busy reset")
+        _busy = False
+        _spinner(False)
+        _status("Timed out")
 
 
 def start_recording():
@@ -110,7 +134,7 @@ def start_recording():
 def stop_and_send():
     """Call on RELEASED. Finalises the recording, saves the WAV, and spawns
     a worker thread to upload it and play the reply."""
-    global _recorded_bytes, _recording, _busy
+    global _recorded_bytes, _recording, _busy, _thread_started_ms
     if not _recording:
         return False
     Mic.end()
@@ -135,6 +159,7 @@ def stop_and_send():
 
     _busy = True
     _spinner(True)
+    _thread_started_ms = time.ticks_ms()
     _thread.start_new_thread(_ask_backend_thread, ())
     return True
 
@@ -263,7 +288,11 @@ def _ask_backend_thread():
         Speaker.begin()
         Speaker.setVolumePercentage(100)
         Speaker.playRaw(memoryview(pcm), SAMPLE_RATE)
+        playback_deadline = time.ticks_add(time.ticks_ms(), MAX_PLAYBACK_S * 1000)
         while Speaker.isPlaying():
+            if time.ticks_diff(playback_deadline, time.ticks_ms()) <= 0:
+                print("[voice] playback cap hit, forcing stop")
+                break
             time.sleep_ms(20)
         Speaker.end()
 

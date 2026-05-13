@@ -521,8 +521,6 @@ def go_next_page():
     # Btn-driven nav: dashboard (0) -> forecast (1) -> voice (2) -> config (3).
     if current_page >= 3:
         return
-    if voice_client.is_busy():
-        return
     prev = current_page
     current_page += 1
     refresh_page()
@@ -536,8 +534,6 @@ def go_next_page():
 def go_prev_page():
     global current_page
     if current_page <= 0:
-        return
-    if voice_client.is_busy():
         return
     prev = current_page
     current_page -= 1

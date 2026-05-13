@@ -356,12 +356,21 @@ async def network_task():
             print("Send watchdog: forcing reset")
             is_sending = False
 
+        voice_client.watchdog_check()
+
         if not wlan_sta.isconnected():
             print("Skipping send: No Wi-Fi")
             continue
 
         if is_sending:
             print("Previous request pending, skipping.")
+            continue
+
+        # Two concurrent TLS sockets on the ESP32 Wi-Fi stack is the scenario
+        # where the voice request most often hangs past its own timeout. Skip
+        # this cycle; the next one will pick up the readings.
+        if voice_client.is_busy():
+            print("Voice active, deferring BigQuery upload one cycle")
             continue
 
         is_sending = True
