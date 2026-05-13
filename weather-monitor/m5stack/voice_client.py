@@ -132,8 +132,8 @@ def start_recording():
 
 
 def stop_and_send():
-    """Call on RELEASED. Finalises the recording, saves the WAV, and spawns
-    a worker thread to upload it and play the reply."""
+    """Call on RELEASED. Finalises the recording and spawns a worker thread
+    that builds the WAV in RAM, uploads it, and plays the reply."""
     global _recorded_bytes, _recording, _busy, _thread_started_ms
     if not _recording:
         return False
@@ -148,15 +148,9 @@ def stop_and_send():
         _status("Too short, try again")
         return False
 
-    _status("Saving...")
-    valid_audio = memoryview(_rec_data)[:_recorded_bytes]
-    try:
-        _save_wav("/flash/recording.wav", valid_audio, SAMPLE_RATE)
-    except Exception as e:
-        print("[voice] save_wav failed:", e)
-        _status("Save error")
-        return False
-
+    # Audio stays in _rec_data (RAM); the WAV header is built at upload time.
+    # Skipping the /flash/recording.wav round-trip removes ~100–300 ms of flash
+    # I/O latency and avoids unnecessary flash wear.
     _busy = True
     _spinner(True)
     _thread_started_ms = time.ticks_ms()
@@ -208,34 +202,41 @@ def _get_header(headers, name):
     return ""
 
 
-def _save_wav(filename, pcm_data, sample_rate, num_channels=1, bits_per_sample=16):
-    with open(filename, "wb") as f:
-        byte_rate = sample_rate * num_channels * (bits_per_sample // 8)
-        block_align = num_channels * (bits_per_sample // 8)
-        data_size = len(pcm_data)
+def _wav_header(data_size, sample_rate=SAMPLE_RATE, num_channels=1, bits_per_sample=16):
+    """Build the 44-byte canonical RIFF/WAVE PCM header in memory.
 
-        f.write(b'RIFF')
-        f.write((36 + data_size).to_bytes(4, 'little'))
-        f.write(b'WAVE')
-        f.write(b'fmt ')
-        f.write((16).to_bytes(4, 'little'))
-        f.write((1).to_bytes(2, 'little'))  # PCM
-        f.write((num_channels).to_bytes(2, 'little'))
-        f.write((sample_rate).to_bytes(4, 'little'))
-        f.write((byte_rate).to_bytes(4, 'little'))
-        f.write((block_align).to_bytes(2, 'little'))
-        f.write((bits_per_sample).to_bytes(2, 'little'))
-        f.write(b'data')
-        f.write((data_size).to_bytes(4, 'little'))
-        f.write(pcm_data)
+    Mirrors the layout previously written to /flash/recording.wav, just
+    without the flash round-trip — the audio is already in RAM in _rec_data,
+    so we prepend this header at upload time and post header + audio directly.
+    """
+    byte_rate = sample_rate * num_channels * (bits_per_sample // 8)
+    block_align = num_channels * (bits_per_sample // 8)
+    h = bytearray(44)
+    h[0:4]   = b'RIFF'
+    h[4:8]   = (36 + data_size).to_bytes(4, 'little')
+    h[8:12]  = b'WAVE'
+    h[12:16] = b'fmt '
+    h[16:20] = (16).to_bytes(4, 'little')           # fmt chunk size
+    h[20:22] = (1).to_bytes(2, 'little')            # PCM format tag
+    h[22:24] = (num_channels).to_bytes(2, 'little')
+    h[24:28] = (sample_rate).to_bytes(4, 'little')
+    h[28:32] = (byte_rate).to_bytes(4, 'little')
+    h[32:34] = (block_align).to_bytes(2, 'little')
+    h[34:36] = (bits_per_sample).to_bytes(2, 'little')
+    h[36:40] = b'data'
+    h[40:44] = (data_size).to_bytes(4, 'little')
+    return h
 
 
 def _ask_backend_thread():
     global _busy
     try:
         _status("Uploading...")
-        with open("/flash/recording.wav", "rb") as f:
-            wav = f.read()
+        # Build the WAV payload in RAM from the recording buffer. We hold the
+        # audio bytes twice momentarily (once in _rec_data, once in `wav`);
+        # at 16 kHz/16-bit/5 s that's ~320 KB total, well within Core S3 PSRAM.
+        audio_view = memoryview(_rec_data)[:_recorded_bytes]
+        wav = bytes(_wav_header(len(audio_view))) + bytes(audio_view)
 
         headers = {
             "Content-Type": "audio/wav",
