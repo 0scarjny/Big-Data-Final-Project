@@ -244,17 +244,32 @@ def _ask_backend_thread():
         }
         if _device_location:
             headers["X-Device-Location"] = str(_device_location)
-        try:
-            resp = requests2.post(
-                VOICE_URL,
-                data=wav,
-                headers=headers,
-                timeout=HTTP_TIMEOUT_S,
-            )
-        except Exception as e:
-            print("[voice] network error:", e)
+
+        # One automatic retry on transient connection errors (ECONNABORTED /
+        # EHOSTUNREACH). These are common on ESP32 right after I2S recording
+        # because mbedTLS needs contiguous internal RAM for the TLS handshake
+        # and memory may be fragmented. A short pause lets lwIP reclaim sockets
+        # from the previous BigQuery upload and defrag the heap.
+        resp = None
+        last_err = None
+        for attempt in range(2):
+            try:
+                resp = requests2.post(
+                    VOICE_URL,
+                    data=wav,
+                    headers=headers,
+                    timeout=HTTP_TIMEOUT_S,
+                )
+                break  # success
+            except Exception as e:
+                last_err = e
+                print("[voice] network error (attempt {}):".format(attempt + 1), e)
+                if attempt == 0:
+                    _status("Retrying...")
+                    time.sleep_ms(1500)  # give lwIP time to reclaim sockets
+        if resp is None:
             _status("Network error")
-            _reply(str(e))
+            _reply(str(last_err))
             return
 
         if resp.status_code != 200:

@@ -57,10 +57,10 @@ _forecast_data = None      # last successful raw forecast dict
 _forecast_fetching = False
 
 # Page 2 (voice) widgets
-voice_btn_rec = None
-voice_label_status = None
-voice_label_reply = None
-voice_spinner = None
+voice_btn_rec      = None   # face circle (lv.obj) — hold to record
+voice_label_status = None   # status label below face
+voice_label_reply  = None   # reply label inside bubble (m5ui.M5Label)
+voice_spinner      = None   # kept None; spinner cb drives face colour
 
 # Page 3 (Wi-Fi configuration) widgets
 cfg_status_label = None
@@ -172,25 +172,68 @@ def _build_forecast_page(font_small, font_tiny, font_weather, text_color, bg_col
 def _build_voice_page(font_small, font_tiny, text_color, bg_color):
     global page2, voice_btn_rec, voice_label_status, voice_label_reply, voice_spinner
 
+    # ── Page ──────────────────────────────────────────────────────────────
     page2 = m5ui.M5Page(bg_c=bg_color)
-    m5ui.M5Label("Ask Assistant", x=12, y=8, text_c=text_color, bg_opa=0, font=font_small, parent=page2)
+    page2.set_flag(lv.obj.FLAG.SCROLLABLE, False)  # M5Page wrapper — set_flag OK
 
-    voice_label_status = m5ui.M5Label("Ready", x=12, y=30, text_c=text_color, bg_opa=0, font=font_tiny, parent=page2)
-    voice_label_status.set_size(300, 18)
+    # ── Title ─────────────────────────────────────────────────────────────
+    # Use M5Label so the m5ui set_flag wrapper is available if needed.
+    m5ui.M5Label(lv.SYMBOL.AUDIO + " Ask Assistant",
+                 x=0, y=2, text_c=text_color, bg_opa=0, font=font_small, parent=page2)
 
-    voice_label_reply = m5ui.M5Label("", x=12, y=52, text_c=text_color, bg_opa=0, font=font_tiny, parent=page2)
-    voice_label_reply.set_size(300, 100)
+    # ── Speech bubble background (M5Label = styled white rounded rect) ────
+    bubble_bg = m5ui.M5Label("", x=8, y=18, bg_c=0xFFFFFF, bg_opa=255, parent=page2)
+    bubble_bg.set_size(304, 118)
+    try:
+        bubble_bg.set_style_radius(12, 0)
+        bubble_bg.set_style_border_width(1, 0)
+        bubble_bg.set_style_border_color(lv.color_hex(0xBBBBBB), 0)
+    except Exception:
+        pass  # styling is cosmetic — don't crash if API varies
 
-    if hasattr(m5ui, "M5Spinner"):
-        voice_spinner = m5ui.M5Spinner(x=110, y=65, w=100, h=100, anim_t=10000, angle=180,
-                                        bg_c=0xE7E3E7, bg_c_indicator=0x2193F3, parent=page2)
-        voice_spinner.set_flag(lv.obj.FLAG.HIDDEN, True)
-    else:
-        voice_spinner = None
+    # ── Reply text (absolute on page, visually inside bubble) ─────────────
+    # Positioned at (18, 26) = bubble (8,18) + inner padding (10, 8).
+    # Use M5Label so set_long_mode delegates to the underlying lv.label.
+    voice_label_reply = m5ui.M5Label(
+        "Hold the mic to ask me anything...",
+        x=18, y=26, text_c=0x444444, bg_opa=0, font=font_tiny, parent=page2,
+    )
+    voice_label_reply.set_size(284, 102)
+    try:
+        voice_label_reply.set_long_mode(lv.label.LONG.WRAP)
+        voice_label_reply.set_style_text_align(lv.TEXT_ALIGN.LEFT, 0)
+    except Exception:
+        pass  # fall back gracefully if long_mode API differs
 
-    voice_btn_rec = m5ui.M5Button(text="HOLD TO ASK", x=60, y=170, w=200, h=60,
-                                   bg_c=0xC0392B, text_c=0xFFFFFF, font=font_small, parent=page2)
+
+    # ── Avatar face circle (raw lv.obj — hold to record) ─────────────────
+    # Intentionally no flag calls: add_flag / clear_flag are not exposed on
+    # raw lv.obj in this UIFlow build (only on m5ui wrappers). Scrollbars
+    # won't appear because the circle has no overflow children.
+    FACE_SIZE = 96
+    face_x = (320 - FACE_SIZE) // 2  # 128 — centred
+    voice_btn_rec = lv.obj(page2)
+    voice_btn_rec.set_pos(face_x, 140)
+    voice_btn_rec.set_size(FACE_SIZE, FACE_SIZE)
+    voice_btn_rec.set_style_radius(FACE_SIZE // 2, 0)
+    voice_btn_rec.set_style_bg_color(lv.color_hex(0xF9D87A), 0)
+    voice_btn_rec.set_style_bg_opa(255, 0)
+    voice_btn_rec.set_style_border_width(2, 0)
+    voice_btn_rec.set_style_border_color(lv.color_hex(0x555555), 0)
+    voice_btn_rec.set_style_pad_all(0, 0)
     voice_btn_rec.add_event_cb(_on_voice_button_event, lv.EVENT.ALL, None)
+
+    # ── Status label (below face) ─────────────────────────────────────────
+    voice_label_status = m5ui.M5Label(
+        "Ready", x=0, y=180, text_c=text_color, bg_opa=0, font=font_tiny, parent=page2,
+    )
+    voice_label_status.set_size(320, 14)
+    try:
+        voice_label_status.set_style_text_align(lv.TEXT_ALIGN.CENTER, 0)
+    except Exception:
+        pass
+
+    voice_spinner = None  # removed; spinner callback now drives face colour
 
     voice_client.prepare()
     voice_client.register_callbacks(_set_voice_status, _set_voice_reply, _show_voice_spinner)
@@ -615,21 +658,11 @@ def set_config_status_disconnected():
 
 def _on_voice_button_event(event_struct):
     event = event_struct.code
-
     if event == lv.EVENT.PRESSED:
         if voice_client.is_busy():
             return
-        try:
-            voice_btn_rec.set_bg_color(0x6B0F0A, 255, 0)
-        except Exception:
-            pass
         voice_client.start_recording()
-
     elif event == lv.EVENT.RELEASED:
-        try:
-            voice_btn_rec.set_bg_color(0xC0392B, 255, 0)
-        except Exception:
-            pass
         voice_client.stop_and_send()
 
 
@@ -638,19 +671,53 @@ def _set_voice_status(text):
         voice_label_status.set_text(text)
     except Exception as e:
         _ui_log("voice status err:", e)
+    # Drive face expression from status text
+    if text in ("Ready", "Timed out", "Too short, try again"):
+        _set_face_state("idle")
+    elif text == "Recording...":
+        _set_face_state("recording")
+    elif text == "Playing...":
+        _set_face_state("speaking")
+    elif text.startswith("Error") or text == "Network error":
+        _set_face_state("error")
+    # "Uploading..." keeps whatever face state is already shown (thinking,
+    # set by _show_voice_spinner when the worker thread starts)
 
 
 def _set_voice_reply(text):
     try:
-        chunks = [text[i:i + 40] for i in range(0, len(text), 40)] or [""]
-        voice_label_reply.set_text("\n".join(chunks[:5]))
+        # LVGL LONG.WRAP on the label handles word-wrap; no manual chunking needed.
+        voice_label_reply.set_text(
+            text if text else "Hold the mic to ask me anything\xe2\x80\xa6"
+        )
     except Exception as e:
         _ui_log("voice reply err:", e)
 
 
 def _show_voice_spinner(visible):
+    # Spinner widget removed (was laggy). Drive face expression instead.
+    _set_face_state("thinking" if visible else "idle")
+
+
+# Face circle colours per assistant state.
+# add_flag / clear_flag are unavailable on raw lv.obj in this UIFlow build,
+# so expression is conveyed purely through background colour — no child widgets.
+_FACE_STATES = {
+    "idle":      0xF9D87A,   # yellow  — ready
+    "recording": 0xFF6B6B,   # red     — listening
+    "thinking":  0x74B9FF,   # blue    — waiting for server
+    "speaking":  0x55EFC4,   # green   — playing reply
+    "error":     0xFF7675,   # pink    — something went wrong
+}
+
+
+def _set_face_state(state):
+    """Swap the face circle's background colour to reflect the current state."""
+    if voice_btn_rec is None:
+        return
+    colour = _FACE_STATES.get(state, _FACE_STATES["idle"])
     try:
-        if voice_spinner is not None:
-            voice_spinner.set_flag(lv.obj.FLAG.HIDDEN, not visible)
+        voice_btn_rec.set_style_bg_color(lv.color_hex(colour), 0)
     except Exception as e:
-        _ui_log("voice spinner err:", e)
+        _ui_log("face state err:", e)
+
