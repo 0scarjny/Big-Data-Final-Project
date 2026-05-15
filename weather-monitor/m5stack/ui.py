@@ -667,21 +667,23 @@ def _on_voice_button_event(event_struct):
 
 
 def _set_voice_status(text):
+    """Update the status label and the face colour. Three stages only:
+        Listening -> Asking -> Speaking -> Ready
+    Plus the obvious error / timeout states."""
     try:
         voice_label_status.set_text(text)
     except Exception as e:
         _ui_log("voice status err:", e)
-    # Drive face expression from status text
     if text in ("Ready", "Timed out", "Too short, try again"):
         _set_face_state("idle")
     elif text == "Recording...":
         _set_face_state("recording")
-    elif text == "Playing...":
+    elif text == "Asking...":
+        _set_face_state("thinking")
+    elif text == "Speaking...":
         _set_face_state("speaking")
     elif text.startswith("Error") or text == "Network error":
         _set_face_state("error")
-    # "Uploading..." keeps whatever face state is already shown (thinking,
-    # set by _show_voice_spinner when the worker thread starts)
 
 
 def _set_voice_reply(text):

@@ -19,18 +19,20 @@ BYTES_PER_SAMPLE = 2
 # --- Backend config ---
 VOICE_URL = 'https://flask-app-868833155300.europe-west6.run.app/voice-assistant'
 SHARED_SECRET = '03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4'
-HTTP_TIMEOUT_S = 30
+
+# Cloud Run + Gemini intent parsing + TTS can legitimately take 60+ seconds.
+# Don't time out faster than that or you'll cancel valid requests.
+HTTP_TIMEOUT_S = 90
 
 # Hard upper bound on how long playback may block before we give up on the
-# Speaker. Without this, a stuck Speaker.isPlaying() flag traps the worker
-# thread forever and the UI never recovers.
+# Speaker. Without this, a stuck Speaker.isPlaying() flag traps the worker.
 MAX_PLAYBACK_S = 15
 
-# External watchdog: if _busy is still True this long after the worker thread
-# was spawned, the thread is presumed wedged (HTTP socket hung past its own
-# timeout, etc.). main.py polls watchdog_check() to force-reset the flag so a
-# new recording can be started. > HTTP_TIMEOUT_S + MAX_PLAYBACK_S.
-VOICE_WATCHDOG_MS = 45_000
+# Simple safety net: if the worker thread is still marked busy this long
+# after it was spawned, something is genuinely wedged — force-reset so the
+# UI isn't stuck. Set well above HTTP_TIMEOUT_S + MAX_PLAYBACK_S so it never
+# fires for normal slow-but-successful requests.
+VOICE_WATCHDOG_MS = 120_000
 
 # --- Recording state ---
 _rec_data = None
@@ -38,7 +40,7 @@ _recorded_bytes = 0
 _start_time = 0
 _recording = False
 _busy = False  # True from press until reply finished playing
-_thread_started_ms = 0  # ticks_ms() when the current worker thread was spawned
+_thread_started_ms = 0  # ticks_ms() when the worker thread was spawned
 
 # --- Device location (set by main.py once IP geolocation completes) ---
 # Sent as X-Device-Location with each request so the backend has a fallback
@@ -105,12 +107,16 @@ def is_busy():
 
 
 def watchdog_check():
-    """Force-reset _busy if the worker thread has been alive longer than
-    VOICE_WATCHDOG_MS. MicroPython _thread has no cancel, so the orphan thread
-    keeps running until its socket fails — but the UI is no longer stuck."""
+    """Safety net: if the worker thread has been busy for more than
+    VOICE_WATCHDOG_MS, something is genuinely wedged — force-reset so the UI
+    can accept new input. MicroPython _thread has no cancel, so any orphan
+    keeps running until its socket fails. Polled by main.network_task."""
     global _busy
-    if _busy and time.ticks_diff(time.ticks_ms(), _thread_started_ms) > VOICE_WATCHDOG_MS:
-        print("[voice] watchdog: forcing _busy reset")
+    if not _busy:
+        return
+    elapsed = time.ticks_diff(time.ticks_ms(), _thread_started_ms)
+    if elapsed > VOICE_WATCHDOG_MS:
+        print("[voice] watchdog: busy for {} ms, force-resetting".format(elapsed))
         _busy = False
         _spinner(False)
         _status("Timed out")
@@ -229,12 +235,18 @@ def _wav_header(data_size, sample_rate=SAMPLE_RATE, num_channels=1, bits_per_sam
 
 
 def _ask_backend_thread():
+    """Single-shot voice request:
+        Asking... -> Speaking... -> Ready
+    No retries, no heartbeats, no per-stage status churn. The HTTP timeout
+    (HTTP_TIMEOUT_S) handles the network side; the watchdog handles the
+    cosmic-ray case where everything else fails.
+    """
     global _busy
     try:
-        _status("Uploading...")
-        # Build the WAV payload in RAM from the recording buffer. We hold the
-        # audio bytes twice momentarily (once in _rec_data, once in `wav`);
-        # at 16 kHz/16-bit/5 s that's ~320 KB total, well within Core S3 PSRAM.
+        _status("Asking...")
+
+        # Build the WAV payload in RAM. Held twice momentarily (~320 KB at
+        # 16 kHz/16-bit/5 s) — fine on Core S3 PSRAM.
         audio_view = memoryview(_rec_data)[:_recorded_bytes]
         wav = bytes(_wav_header(len(audio_view))) + bytes(audio_view)
 
@@ -245,31 +257,16 @@ def _ask_backend_thread():
         if _device_location:
             headers["X-Device-Location"] = str(_device_location)
 
-        # One automatic retry on transient connection errors (ECONNABORTED /
-        # EHOSTUNREACH). These are common on ESP32 right after I2S recording
-        # because mbedTLS needs contiguous internal RAM for the TLS handshake
-        # and memory may be fragmented. A short pause lets lwIP reclaim sockets
-        # from the previous BigQuery upload and defrag the heap.
-        resp = None
-        last_err = None
-        for attempt in range(2):
-            try:
-                resp = requests2.post(
-                    VOICE_URL,
-                    data=wav,
-                    headers=headers,
-                    timeout=HTTP_TIMEOUT_S,
-                )
-                break  # success
-            except Exception as e:
-                last_err = e
-                print("[voice] network error (attempt {}):".format(attempt + 1), e)
-                if attempt == 0:
-                    _status("Retrying...")
-                    time.sleep_ms(1500)  # give lwIP time to reclaim sockets
-        if resp is None:
+        # One attempt. requests2 will block here for up to HTTP_TIMEOUT_S
+        # seconds; that's expected — Cloud Run + Gemini is slow.
+        try:
+            resp = requests2.post(
+                VOICE_URL, data=wav, headers=headers, timeout=HTTP_TIMEOUT_S,
+            )
+        except Exception as e:
+            print("[voice] network error:", e)
             _status("Network error")
-            _reply(str(last_err))
+            _reply(str(e))
             return
 
         if resp.status_code != 200:
@@ -282,12 +279,10 @@ def _ask_backend_thread():
             resp.close()
             return
 
-        # MicroPython requests2 stores headers in various ways depending on
-        # version (dict / dict-like with lowercase keys / list of tuples / not
-        # at all). Try every shape we've seen.
+        # Pull the transcript + reply text from response headers, and the
+        # PCM body from .content. Header shape varies across requests2
+        # versions — _get_header handles all the cases we've seen.
         headers_obj = getattr(resp, "headers", None)
-        print("[voice] headers type:", type(headers_obj).__name__,
-              " value:", repr(headers_obj)[:200])
         transcript = _get_header(headers_obj, "X-Transcript")
         reply_text = _get_header(headers_obj, "X-Response-Text")
         pcm = resp.content
@@ -299,7 +294,7 @@ def _ask_backend_thread():
             print("[voice] reply:", reply_text)
         _reply(reply_text or "(no text)")
         _spinner(False)
-        _status("Playing...")
+        _status("Speaking...")
 
         Speaker.begin()
         Speaker.setVolumePercentage(100)

@@ -11,6 +11,8 @@
 import time
 import requests2
 
+DEBUG = True  # flip to False once everything works
+
 FORECAST_URL = 'https://flask-app-868833155300.europe-west6.run.app/get_forecast'
 SHARED_SECRET = '03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4'
 HTTP_TIMEOUT_S = 25  # Cloud Run cold starts can take 15-20 s
@@ -19,6 +21,9 @@ DEFAULT_CITY = "Lausanne"
 
 DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
+def _log(*args):
+    if DEBUG:
+        print("[forecast]", *args)
 
 def fetch(city=None):
     """Fetch the raw forecast JSON. Returns dict on success, None on failure."""
@@ -27,28 +32,29 @@ def fetch(city=None):
     try:
         resp = requests2.post(FORECAST_URL, json=payload, timeout=HTTP_TIMEOUT_S)
         if resp.status_code != 200:
-            print("[forecast] HTTP", resp.status_code)
+            _log("HTTP", resp.status_code)
             resp.close()
             return None
         data = resp.json()
         resp.close()
         if data.get("status") != "success":
-            print("[forecast] backend error:", data.get("error"))
+            _log("backend error:", data.get("error"))
             return None
         return data.get("data") or None
     except Exception as e:
-        print("[forecast] fetch error:", e)
+        _log("fetch error:", e)
         return None
 
 
 def _local_struct(ts_utc, tz_offset_s):
-    """Convert a UTC unix timestamp to a localtime struct in the city's tz.
+    """Return a struct_time whose fields read as the city's wall clock.
 
-    MicroPython's time.localtime takes seconds; the simplest portable trick is
-    to add the city offset to the UTC timestamp and call localtime — that
-    yields fields that read as the city's wall clock.
+    Uses gmtime (not localtime) so the result is independent of the host
+    system's timezone. gmtime exists in both CPython and MicroPython and
+    performs a pure UTC unpack; adding the city's offset to the UTC
+    timestamp shifts the resulting fields to the city's local time.
     """
-    return time.localtime(ts_utc + tz_offset_s)
+    return time.gmtime(ts_utc + tz_offset_s)
 
 
 def today_buckets(data, max_slots=6):
