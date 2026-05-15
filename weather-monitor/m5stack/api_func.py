@@ -4,8 +4,9 @@
 import json
 import requests2 as requests
 
+from config import IPDATA_KEY
+
 DEBUG = True  # flip to False once everything works
-IPDATA_KEY = "e2f1b4d9820c7256c8ccf858c57a98d71319a84664c01d23886f1ef6"
 
 
 def _log(*args):

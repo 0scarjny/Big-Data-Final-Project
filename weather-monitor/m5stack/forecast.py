@@ -11,10 +11,10 @@
 import time
 import requests2
 
+from config import SHARED_SECRET, FORECAST_URL
+
 DEBUG = True  # flip to False once everything works
 
-FORECAST_URL = 'https://flask-app-868833155300.europe-west6.run.app/get_forecast'
-SHARED_SECRET = '03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4'
 HTTP_TIMEOUT_S = 25  # Cloud Run cold starts can take 15-20 s
 
 DEFAULT_CITY = "Lausanne"

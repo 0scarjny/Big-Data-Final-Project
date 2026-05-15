@@ -11,14 +11,12 @@ import time
 from M5 import Mic, Speaker
 import requests2
 
+from config import SHARED_SECRET, VOICE_URL
+
 # --- Audio config ---
 SAMPLE_RATE = 16000
 MAX_RECORD_TIME_SEC = 5
 BYTES_PER_SAMPLE = 2
-
-# --- Backend config ---
-VOICE_URL = 'https://flask-app-868833155300.europe-west6.run.app/voice-assistant'
-SHARED_SECRET = '03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4'
 
 # Cloud Run + Gemini intent parsing + TTS can legitimately take 60+ seconds.
 # Don't time out faster than that or you'll cancel valid requests.

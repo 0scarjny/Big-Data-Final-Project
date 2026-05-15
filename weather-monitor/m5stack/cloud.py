@@ -3,10 +3,9 @@ import json
 import requests2
 
 import led
-from api_func import get_location_from_ip, IPDATA_KEY
+from api_func import get_location_from_ip
+from config import SHARED_SECRET, IPDATA_KEY, BIGQUERY_URL
 
-BIGQUERY_URL = 'https://flask-app-868833155300.europe-west6.run.app/send-to-bigquery'
-SHARED_SECRET = '03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4'
 HTTP_TIMEOUT_S = 10
 
 
