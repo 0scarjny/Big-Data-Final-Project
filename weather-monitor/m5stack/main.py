@@ -381,6 +381,16 @@ async def network_task():
         )
 
 
+async def ui_render_task():
+    """Drains ui._pending into LVGL on the asyncio loop. This is the *only*
+    thread that touches LVGL after init() — worker threads queue updates via
+    ui.set_*/update_*, and this task applies them. Step 2 of the
+    snappy-lantern plan."""
+    while True:
+        await ui.wait_dirty()
+        ui.flush_pending()
+
+
 async def wifi_keepalive_task():
     """Cheap STA reconnect watchdog. Replaces WifiManager.start_managing(),
     which retried on a tight 10 s cadence with full blocking scans. We poll
@@ -459,6 +469,7 @@ async def main():
         print("[main] STA failed after {} attempts - entering config mode".format(BOOT_WIFI_ATTEMPTS))
         ui.go_to_page(3)
 
+    asyncio.create_task(ui_render_task())
     asyncio.create_task(wifi_keepalive_task())
     asyncio.create_task(ui_task())
     asyncio.create_task(clock_task())
