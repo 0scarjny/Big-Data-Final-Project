@@ -207,15 +207,20 @@ def _build_dashboard_page(font_big, font_small, font_tiny, font_medium, font_lar
 
     page0 = m5ui.M5Page(bg_c=bg_color)
 
-    # --- Header (WiFi left, Date center, City right) ---
-    wifi_ind = m5ui.M5Label(lv.SYMBOL.WIFI, x=5, y=5,
-                             text_c=0xE74C3C, bg_opa=0, font=safe_font(14), parent=page0)
-
-    date_label = m5ui.M5Label("--- --", x=80, y=5,
+    # --- Header (Date left, WiFi center, City right) ---
+    date_label = m5ui.M5Label("--- --", x=5, y=5,
                                text_c=text_color, bg_opa=0, font=font_small, parent=page0)
     date_label.set_size(160, 18)
     try:
-        date_label.set_style_text_align(lv.TEXT_ALIGN.CENTER, 0)
+        date_label.set_style_text_align(lv.TEXT_ALIGN.LEFT, 0)
+    except Exception:
+        pass
+
+    wifi_ind = m5ui.M5Label(lv.SYMBOL.WIFI, x=80, y=5,
+                             text_c=0xE74C3C, bg_opa=0, font=safe_font(14), parent=page0)
+    wifi_ind.set_size(160, 18)
+    try:
+        wifi_ind.set_style_text_align(lv.TEXT_ALIGN.CENTER, 0)
     except Exception:
         pass
 
@@ -293,12 +298,12 @@ def _build_dashboard_page(font_big, font_small, font_tiny, font_medium, font_lar
     bar_wet     = m5ui.M5Label("", x=211, y=BAR_Y, bg_c=0x2980B9, bg_opa=255, parent=page0)
     bar_wet.set_size(103, 24)
 
-    m5ui.M5Label("DRY",     x=43,  y=LABL_Y, text_c=0xFFFFFF, bg_opa=0, font=font_tiny, parent=page0)
-    m5ui.M5Label("COMFORT", x=130, y=LABL_Y, text_c=0xFFFFFF, bg_opa=0, font=font_tiny, parent=page0)
-    m5ui.M5Label("WET",     x=248, y=LABL_Y, text_c=0xFFFFFF, bg_opa=0, font=font_tiny, parent=page0)
+    m5ui.M5Label("DRY",     x=40,  y=LABL_Y, text_c=0xFFFFFF, bg_opa=0, font=font_tiny, parent=page0)
+    m5ui.M5Label("COMFORT", x=122, y=LABL_Y, text_c=0xFFFFFF, bg_opa=0, font=font_tiny, parent=page0)
+    m5ui.M5Label("WET",     x=245, y=LABL_Y, text_c=0xFFFFFF, bg_opa=0, font=font_tiny, parent=page0)
 
     # humidity % label and arrow — x repositioned dynamically by _apply_humidity
-    hum_val_label = m5ui.M5Label("--", x=150, y=193,
+    hum_val_label = m5ui.M5Label("--", x=150, y=190,
                                   text_c=text_color, bg_opa=0, font=font_tiny, parent=page0)
     comfort_arrow = m5ui.M5Label(lv.SYMBOL.DOWN, x=155, y=205,
                                   text_c=text_color, bg_opa=0, font=safe_font(14), parent=page0)
@@ -737,7 +742,7 @@ def _apply_forecast_loading():
 def _apply_cfg_ap(info):
     _assert_main()
     try:
-        cfg_status_label.set_text("AP mode - connect to set up Wi-Fi")
+        cfg_status_label.set_text("AP mode - connect to set up device")
         cfg_status_label.set_text_color(0xC0392B, 255, lv.PART.MAIN)
         _set_qr(info["url"])
         cfg_ssid_label.set_text("Wi-Fi: " + info.get("essid", ""))
