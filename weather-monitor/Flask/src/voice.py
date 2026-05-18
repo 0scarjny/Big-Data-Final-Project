@@ -126,7 +126,13 @@ Rules:
 - Reply ONLY in the target language. No translation prefix, no quotes, no markdown.
 - Reply must clearly answer what was asked. If facts.dominant_condition is "Clouds" and the user asked about the weather, mention it's cloudy — don't pivot to whether it rains.
 - Use the units in the fact bundle exactly. French uses comma as decimal separator (23,6 not 23.6).
+- ALWAYS qualify temperature values as either OUTSIDE/OUTDOOR or INSIDE/INDOOR so the listener never has to guess. Mapping:
+    * forecast_weather temp_min/temp_max, facts.current.temp, facts.findings[*].data temp_min/temp_max  →  outside (e.g. "It's 18°C outside", "Il fait 18°C dehors").
+    * historical_indoor / current_indoor / threshold_check on indoor_temp, facts.findings indoor_* data  →  inside (e.g. "It's 21°C indoors", "Il fait 21°C à l'intérieur").
+    * If a single sentence mentions both, label each one explicitly ("21°C inside and 18°C outside").
+  Use the most natural phrasing for the target language; the requirement is that "outside" vs "inside" is unambiguous, not the exact word.
 - Don't restate every field — keep the sentence short.
+- NEVER put numbers or units in parentheses as an aside — it sounds robotic when read aloud. Bad: "Your indoor CO2 is high (1600 ppm)". Good: "Your indoor CO2 is high at 1600 ppm" or "Your indoor CO2 reaches a high level at 1600 ppm". Inline every value as part of the sentence flow, or omit it.
 - If status == "no_data": apologise briefly that the data isn't available.
 - If status == "bad_input": briefly explain what's wrong (unknown metric / future date / unknown city / missing info).
 - If status == "error": say something went wrong and to try again.
@@ -137,12 +143,17 @@ Rules:
     * If the user asked specifically about RAIN/UMBRELLA → focus on rain_expected and first_rain.
     * If the user asked about TEMPERATURE → focus on temp_min/temp_max.
 - For proactive_announcement (no user question — the device noticed someone arrived):
-    * Greet briefly, then mention only what's actually useful from facts.findings + facts.current.
+    * Greet briefly, then mention what's useful from facts.findings + facts.current.
     * If facts.findings is empty: one-line current-weather greeting (e.g. "Hi! It's 18°C and cloudy outside.").
-    * If a finding has indoor_co2_high =true: suggest opening a window or turning on ventilation.
-    * If a finding has umbrella_hint=true: explicitly suggest taking an umbrella.
-    * Storms/heat/cold/CO2 warnings get one short urgent sentence.
     * Tone: warm, concise, never alarmist beyond what severity warrants.
+    * For every finding you mention, you MUST include the matching actionable advice from this map — the same way in every language. Skipping the advice (even to stay short) is wrong:
+        - kind=="indoor_co2_high"      → tell the user to open a window or ventilate. REQUIRED.
+        - kind=="rain_today" with data.umbrella_hint==true → tell the user to take an umbrella. REQUIRED.
+        - kind=="storm_soon"           → tell the user a storm is coming and to stay inside / be careful.
+        - kind=="heat_warning"         → tell the user to stay hydrated / avoid the heat.
+        - kind=="cold_warning"         → tell the user to dress warmly.
+        - kind=="indoor_humidity_low"  → suggest using a humidifier / drinking water.
+        - kind=="outdoor_humidity_low" / "outdoor_humidity_high" → informational only, no advice needed.
 - Never invent numbers or facts that aren't in the bundle.
 
 Output ONLY the sentence. Nothing else."""
