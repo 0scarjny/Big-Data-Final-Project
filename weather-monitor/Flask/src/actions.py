@@ -253,6 +253,101 @@ def forecast_weather(hours_ahead=24, city=None):
     }
 
 
+def critical_findings(location, indoor_temp=None, indoor_humidity=None,
+                      indoor_co2=None, context="presence"):
+    """Return a list of "things worth telling the user right now" derived from
+    the outdoor forecast + the latest indoor sensor values.
+
+    Each finding: {"kind": str, "severity": "info"|"warn", "data": {...}}.
+
+    `context` is "presence" (someone walked in) or "morning_check" (first
+    presence in the morning window). The endpoint uses context to decide
+    whether silence is acceptable when no findings fire.
+    """
+    findings = []
+
+    forecast = forecast_weather(hours_ahead=12, city=location)
+    current = None
+    try:
+        current = openweather.fetch_current(location)
+    except Exception as e:
+        log.warning("critical_findings: fetch_current failed: %s", e)
+
+    if forecast.get("status") == "ok":
+        if "Thunderstorm" in (forecast.get("all_conditions") or []):
+            findings.append({
+                "kind": "storm_soon",
+                "severity": "warn",
+                "data": {"when": (forecast.get("first_rain") or {}).get("when")},
+            })
+        if forecast.get("rain_expected"):
+            findings.append({
+                "kind": "rain_today",
+                "severity": "warn" if context == "morning_check" else "info",
+                "data": {
+                    "first_rain": forecast.get("first_rain"),
+                    "buckets": forecast.get("rain_buckets"),
+                    "umbrella_hint": context == "morning_check",
+                },
+            })
+        if (forecast.get("temp_max") or 0) > 32:
+            findings.append({
+                "kind": "heat_warning",
+                "severity": "warn",
+                "data": {"temp_max": forecast["temp_max"], "unit": forecast.get("temp_unit", "°C")},
+            })
+        if (forecast.get("temp_min") if forecast.get("temp_min") is not None else 99) < 0:
+            findings.append({
+                "kind": "cold_warning",
+                "severity": "warn",
+                "data": {"temp_min": forecast["temp_min"], "unit": forecast.get("temp_unit", "°C")},
+            })
+
+    if current is not None:
+        out_h = (current.get("main") or {}).get("humidity")
+        if out_h is not None:
+            if out_h < 30:
+                findings.append({"kind": "outdoor_humidity_low", "severity": "info", "data": {"humidity": out_h}})
+            elif out_h > 85:
+                findings.append({"kind": "outdoor_humidity_high", "severity": "info", "data": {"humidity": out_h}})
+
+    if indoor_co2 is not None and indoor_co2 > 1500:
+        findings.append({
+            "kind": "indoor_co2_high",
+            "severity": "warn",
+            "data": {"co2": indoor_co2, "unit": "ppm"},
+        })
+    if indoor_humidity is not None and indoor_humidity < 25:
+        findings.append({
+            "kind": "indoor_humidity_low",
+            "severity": "info",
+            "data": {"humidity": indoor_humidity, "unit": "%"},
+        })
+
+    log.info(f"Critical findings for {location}: {findings} (context: {context}, indoor_temp={indoor_temp}, indoor_humidity={indoor_humidity}, indoor_co2={indoor_co2})")
+
+    return {
+        "findings": findings,
+        "forecast": forecast if forecast.get("status") == "ok" else None,
+        "current": _current_summary(current),
+    }
+
+
+def _current_summary(current):
+    """Trim the OpenWeather current-weather payload down to just the fields the
+    formatter needs for a one-line greeting."""
+    if not current:
+        return None
+    main = current.get("main") or {}
+    weather = (current.get("weather") or [{}])[0]
+    return {
+        "temp": main.get("temp"),
+        "humidity": main.get("humidity"),
+        "description": weather.get("description"),
+        "condition": weather.get("main"),
+    }
+
+
 def dispatch(intent):
     """Returns a structured facts dict. Never raises — errors become a dict
     with status='error' so the formatter can phrase it for the user."""

@@ -274,6 +274,74 @@ def voice_assistant():
     )
 
 
+@app.route("/critical-announcement", methods=["POST"])
+def critical_announcement():
+    """Proactive announcement triggered by the device when it detects a human.
+
+    Body JSON:
+      location          (str, required)  city for forecast + current weather
+      indoor_temp       (float, optional)
+      indoor_humidity   (float, optional)
+      indoor_co2        (float, optional)
+      context           (str)             "presence" (default) or "morning_check"
+      language          (str)             BCP-47, default "en-US"
+
+    Returns:
+      200 audio/L16 PCM with X-Response-Text + X-Findings-Count headers, OR
+      204 No Content when context=morning_check and there's nothing to nag about.
+    """
+    if request.headers.get("X-Shared-Secret") != PASSWORD_HASH:
+        return {"status": "failed", "error": "auth"}, 401
+    payload = request.get_json(force=True) or {}
+    location = (payload.get("location") or "").strip()
+    if not location:
+        return {"status": "failed", "error": "missing 'location'"}, 400
+
+    context = (payload.get("context") or "presence").strip()
+    if context not in ("presence", "morning_check"):
+        return {"status": "failed", "error": "context must be 'presence' or 'morning_check'"}, 400
+    language = (payload.get("language") or "en-US").strip()
+
+    bundle = actions.critical_findings(
+        location=location,
+        indoor_temp=payload.get("indoor_temp"),
+        indoor_humidity=payload.get("indoor_humidity"),
+        indoor_co2=payload.get("indoor_co2"),
+        context=context,
+    )
+    findings = bundle["findings"]
+    has_rain = any(f["kind"] == "rain_today" for f in findings)
+
+    # Morning check is meant to be the umbrella reminder. If it's not raining,
+    # stay silent — the user just walked in, no need to greet them every day.
+    if context == "morning_check" and not has_rain:
+        log.info("morning_check: no rain for %s, returning 204", location)
+        return ("", 204)
+
+    facts = {
+        "intent": "proactive_announcement",
+        "status": "ok",
+        "context": context,
+        "findings": findings,
+        "current": bundle["current"],
+        "forecast": bundle["forecast"],
+    }
+    reply_text = voice.format_response(facts, language, transcript="")
+    log.info("Announcement [%s, %s, %d findings]: %r",
+             context, language, len(findings), reply_text)
+    pcm = voice.synthesize(reply_text, language_code=language)
+    return Response(
+        pcm,
+        mimetype="audio/L16; rate=16000",
+        headers={
+            "X-Response-Text": voice.header_safe(reply_text)[:512],
+            "X-Language": voice.header_safe(language)[:32],
+            "X-Findings-Count": str(len(findings)),
+            "X-Context": voice.header_safe(context)[:32],
+        },
+    )
+
+
 @app.route("/voice-assistant/text", methods=["POST"])
 def voice_assistant_text():
     """Test helper: skip STT/TTS, send a text question, get a JSON reply.

@@ -136,6 +136,13 @@ Rules:
     * If the user asked about the WEATHER in general → mention temp range AND dominant_condition; mention rain only if rain_expected=true and relevant.
     * If the user asked specifically about RAIN/UMBRELLA → focus on rain_expected and first_rain.
     * If the user asked about TEMPERATURE → focus on temp_min/temp_max.
+- For proactive_announcement (no user question — the device noticed someone arrived):
+    * Greet briefly, then mention only what's actually useful from facts.findings + facts.current.
+    * If facts.findings is empty: one-line current-weather greeting (e.g. "Hi! It's 18°C and cloudy outside.").
+    * If a finding has indoor_co2_high =true: suggest opening a window or turning on ventilation.
+    * If a finding has umbrella_hint=true: explicitly suggest taking an umbrella.
+    * Storms/heat/cold/CO2 warnings get one short urgent sentence.
+    * Tone: warm, concise, never alarmist beyond what severity warrants.
 - Never invent numbers or facts that aren't in the bundle.
 
 Output ONLY the sentence. Nothing else."""
@@ -380,7 +387,7 @@ def _short_reply_config():
     """
     base = dict(
         system_instruction=RESPONSE_SYSTEM_PROMPT,
-        max_output_tokens=512,
+        max_output_tokens=1024,
         temperature=0.3,
     )
     ThinkingConfig = getattr(genai_types, "ThinkingConfig", None)
@@ -409,7 +416,7 @@ _FALLBACK = {
         "no_data":       "I don't have data for that period.",
         "bad_input":     "I couldn't process that request.",
         "error":         "Something went wrong. Please try again.",
-        "unknown_intent":"Sorry, I didn't understand the question.",
+        "unknown_intent":"Sorry, I didn't understand the question. Please try again or ask a different question.",
         "default":       "Sorry, something went wrong.",
     },
     "fr": {
@@ -417,7 +424,7 @@ _FALLBACK = {
         "no_data":       "Je n'ai pas de données pour cette période.",
         "bad_input":     "Je n'ai pas pu traiter cette demande.",
         "error":         "Une erreur s'est produite. Veuillez réessayer.",
-        "unknown_intent":"Désolé, je n'ai pas compris la question.",
+        "unknown_intent":"Désolé, je n'ai pas compris la question. Veuillez réessayer ou poser une question différente.",
         "default":       "Désolé, une erreur s'est produite.",
     },
 }
