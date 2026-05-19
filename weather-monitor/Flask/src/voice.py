@@ -493,3 +493,18 @@ def header_safe(text):
     # and gets dropped by encode/decode.
     normalized = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     return _HEADER_SAFE.sub("?", normalized)
+
+
+def _prewarm():
+    """Eagerly build the Vertex client and probe a Gemini model at import
+    time so the first /voice-assistant request doesn't pay multi-second
+    cold-start costs. Wrapped in try/except — if Vertex is briefly
+    unreachable at boot we still want the module to import."""
+    try:
+        _client()
+        _pick_model()
+    except Exception as e:
+        log.warning("Prewarm skipped: %s: %s", type(e).__name__, e)
+
+
+_prewarm()

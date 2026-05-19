@@ -1,5 +1,6 @@
 import json
 import os
+import time
 
 import requests
 from flask import Flask, Response, request
@@ -233,6 +234,7 @@ def voice_assistant():
     if request.headers.get("X-Shared-Secret") != PASSWORD_HASH:
         return {"status": "failed", "error": "auth"}, 401
 
+    _t0 = time.monotonic()
     wav_bytes = request.get_data()
     if not wav_bytes:
         log.warning("Received empty body on /voice-assistant")
@@ -262,6 +264,7 @@ def voice_assistant():
     log.info("Synthesising reply [%s]: %r", language, reply_text)
     pcm = voice.synthesize(reply_text, language_code=language)
     log.info("TTS produced %d bytes of PCM audio", len(pcm))
+    elapsed_ms = int((time.monotonic() - _t0) * 1000)
     return Response(
         pcm,
         mimetype="audio/L16; rate=8000",
@@ -270,6 +273,7 @@ def voice_assistant():
             "X-Transcript": voice.header_safe(transcript)[:512],
             "X-Language": voice.header_safe(language)[:32],
             "X-Intent-Action": voice.header_safe(str(intent.get("action", "unknown")))[:64],
+            "X-Server-Elapsed-Ms": str(elapsed_ms),
         },
     )
 
@@ -292,6 +296,7 @@ def critical_announcement():
     """
     if request.headers.get("X-Shared-Secret") != PASSWORD_HASH:
         return {"status": "failed", "error": "auth"}, 401
+    _t0 = time.monotonic()
     payload = request.get_json(force=True) or {}
     location = (payload.get("location") or "").strip()
     if not location:
@@ -330,6 +335,7 @@ def critical_announcement():
     log.info("Announcement [%s, %s, %d findings]: %r",
              context, language, len(findings), reply_text)
     pcm = voice.synthesize(reply_text, language_code=language)
+    elapsed_ms = int((time.monotonic() - _t0) * 1000)
     return Response(
         pcm,
         mimetype="audio/L16; rate=8000",
@@ -338,6 +344,7 @@ def critical_announcement():
             "X-Language": voice.header_safe(language)[:32],
             "X-Findings-Count": str(len(findings)),
             "X-Context": voice.header_safe(context)[:32],
+            "X-Server-Elapsed-Ms": str(elapsed_ms),
         },
     )
 
