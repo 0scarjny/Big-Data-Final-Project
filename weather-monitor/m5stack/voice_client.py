@@ -16,7 +16,7 @@ from config import SHARED_SECRET, VOICE_URL, ANNOUNCEMENT_URL
 
 # --- Audio config ---
 SAMPLE_RATE = 16000
-MAX_RECORD_TIME_SEC = 5
+MAX_RECORD_TIME_SEC = 10
 BYTES_PER_SAMPLE = 2
 
 # Cloud Run + Gemini intent parsing + TTS can legitimately take 60+ seconds.
@@ -239,7 +239,11 @@ def _play_pcm(pcm):
     Mic and Speaker share I2S, so we own Speaker.begin/end here."""
     Speaker.begin()
     Speaker.setVolumePercentage(100)
+    print("[voice] playRaw start")
+    t_play = time.ticks_ms()
     Speaker.playRaw(memoryview(pcm), SAMPLE_RATE)
+    print("[voice] playRaw returned in {}ms".format(
+        time.ticks_diff(time.ticks_ms(), t_play)))
     playback_deadline = time.ticks_add(time.ticks_ms(), MAX_PLAYBACK_S * 1000)
     while Speaker.isPlaying():
         if time.ticks_diff(playback_deadline, time.ticks_ms()) <= 0:
@@ -303,6 +307,7 @@ def _announcement_thread():
             "X-Shared-Secret": SHARED_SECRET,
         }
 
+        t0 = time.ticks_ms()
         try:
             resp = requests2.post(
                 ANNOUNCEMENT_URL,
@@ -313,6 +318,7 @@ def _announcement_thread():
         except Exception as e:
             print("[announce] network error:", e)
             return
+        t1 = time.ticks_ms()
 
         try:
             if resp.status_code == 204:
@@ -328,15 +334,57 @@ def _announcement_thread():
                 return
 
             reply_text = _get_header(getattr(resp, "headers", None), "X-Response-Text")
+            t2 = time.ticks_ms()
             if reply_text:
                 print("[announce] saying:", reply_text)
-            pcm = resp.content
+
+            # Read body in larger chunks to dodge the O(n^2) bytes concat that
+            # requests2.content does internally — on 150 KB of PCM that's
+            # tens of seconds of GC churn on the ESP32.
+            CHUNK = 4096
+            clen_str = _get_header(getattr(resp, "headers", None), "Content-Length")
+            try:
+                clen = int(clen_str) if clen_str else 0
+            except ValueError:
+                clen = 0
+            raw = getattr(resp, "raw", None)
+            if raw is not None and clen > 0:
+                read_path = "readinto"
+                pcm = bytearray(clen)
+                view = memoryview(pcm)
+                pos = 0
+                while pos < clen:
+                    n = raw.readinto(view[pos:pos + CHUNK])
+                    if not n:
+                        break
+                    pos += n
+                if pos < clen:
+                    pcm = pcm[:pos]
+            elif raw is not None:
+                read_path = "extend"
+                pcm = bytearray()
+                while True:
+                    chunk = raw.read(CHUNK)
+                    if not chunk:
+                        break
+                    pcm.extend(chunk)
+            else:
+                read_path = "content"
+                pcm = resp.content
+            t3 = time.ticks_ms()
         finally:
             try:
                 resp.close()
             except Exception:
                 pass
 
+        print("[announce] timings: post={}ms headers={}ms body={}ms({}) size={}B".format(
+            time.ticks_diff(t1, t0),
+            time.ticks_diff(t2, t1),
+            time.ticks_diff(t3, t2),
+            read_path,
+            len(pcm),
+        ))
         _play_pcm(pcm)
         success = True
     except Exception as e:
