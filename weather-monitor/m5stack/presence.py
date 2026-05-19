@@ -17,7 +17,7 @@ MORNING_WINDOW = (6, 30, 9, 30)
 # Flip to True during development to get rising-edge motion logs + cooldown
 # verdicts. Leave False in production — is_motion() is polled at 2 Hz and even
 # rising-edge logs add up fast over a day.
-DEBUG = True
+DEBUG = False
 
 _pir = None                        # PIRUnit instance (replaces raw Pin)
 _last_announcement_ms = None       # ticks_ms() of last successful announcement

@@ -408,13 +408,14 @@ async def presence_task():
         ctx = presence.should_announce(time.localtime())
         if ctx is None:
             continue
-        # Capture ctx in the lambda default so the closure sees the right
-        # value if a second trigger arrives before this one resolves.
+        # Mark the cooldown as soon as the backend returns 200/204 — before
+        # the (slow) body read — so a second motion event during the read
+        # can't queue a duplicate request.
         voice_client.request_announcement(
             location_str or "Lausanne",
             temperature, humidity, co2,
             ctx,
-            on_done=lambda ok, ctx=ctx: presence.mark_announced(ctx, time.localtime()) if ok else None,
+            on_response_ok=lambda ctx=ctx: presence.mark_announced(ctx, time.localtime()),
         )
 
 
