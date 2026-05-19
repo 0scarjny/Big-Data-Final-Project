@@ -5,10 +5,13 @@
 #   today_buckets() — up to 6 of today's 3-hour slots from now forward
 #   week_days()     — 5 daily summaries (min/max temp + representative icon)
 #
-# All HTTP work runs in the caller's thread (typically a worker spawned from
-# main.py's forecast_task) so the asyncio loop is never blocked.
+# fetch() is a coroutine. The underlying requests2.post is still synchronous
+# (no async HTTP client available in this MicroPython build), so the loop
+# pauses for the duration of a fetch — acceptable because it's at most once
+# every FORECAST_REFRESH_S (30 min) on the connected path.
 
 import time
+import asyncio
 import requests2
 
 from config import SHARED_SECRET, FORECAST_URL
@@ -25,10 +28,12 @@ def _log(*args):
     if DEBUG:
         print("[forecast]", *args)
 
-def fetch(city=None):
+async def fetch(city=None):
     """Fetch the raw forecast JSON. Returns dict on success, None on failure."""
     city = city or DEFAULT_CITY
     payload = {"passwd": SHARED_SECRET, "city": city}
+    # Yield once before the blocking POST so any pending UI work flushes first.
+    await asyncio.sleep_ms(0)
     try:
         resp = requests2.post(FORECAST_URL, json=payload, timeout=HTTP_TIMEOUT_S)
         if resp.status_code != 200:

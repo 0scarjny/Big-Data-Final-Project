@@ -1,21 +1,21 @@
 # Voice client for the M5Stack weather monitor.
 #
-# Two request kinds share one long-lived worker thread:
+# Two request kinds share one long-lived async worker task:
 #   - 'announcement': PIR motion → proactive TTS via /critical-announcement
 #   - 'voice':        button press → STT/intent/TTS via /voice-assistant
 #
 # Concurrency model:
 #   - Single _busy flag. A second submission while busy is rejected.
 #   - Single _pending slot. Submitter writes; worker reads then clears.
-#   - One long-lived worker thread, started lazily at first submission and
-#     wrapped in a never-die outer try/except so a stray exception can't
-#     permanently brick the device.
+#   - One long-lived async task (started from main.py at boot) wrapped in a
+#     never-die outer try/except so a stray exception can't permanently brick
+#     the device.
 #   - Module-level _current_resp lets the watchdog cancel a stuck request by
 #     closing the response — the worker's readinto raises and unwinds cleanly.
 #   - Per-read socket timeout (best-effort) bounds individual reads when the
 #     underlying requests2 build exposes the socket.
 
-import _thread
+import asyncio
 import time
 import json
 
@@ -74,12 +74,10 @@ _recording = False
 _busy = False
 _busy_started_ms = 0
 _pending = None     # ('announcement', args) | ('voice', args) | None
+_pending_event = asyncio.Event()
 
 # Active HTTP response — the watchdog closes this to cancel a stuck read.
 _current_resp = None
-
-# Worker thread lifecycle
-_worker_started = False
 
 # Device-set state
 _device_location = None
@@ -158,7 +156,7 @@ def request_announcement(location, indoor_temp, indoor_humidity, indoor_co2,
     _pending = ('announcement',
                 (location, indoor_temp, indoor_humidity, indoor_co2,
                  context, on_response_ok))
-    _ensure_worker()
+    _pending_event.set()
     return True
 
 
@@ -199,14 +197,14 @@ def stop_and_send():
     # Snapshot the recording so the next press can clobber _rec_data freely.
     audio_bytes = bytes(memoryview(_rec_data)[:_recorded_bytes])
     _pending = ('voice', (audio_bytes,))
-    _ensure_worker()
+    _pending_event.set()
     return True
 
 
 def watchdog_check():
     """Last-resort cancellation. After VOICE_WATCHDOG_MS, close the active
-    response so the worker's readinto raises and the thread unwinds cleanly,
-    then clear _busy. Polled by main.network_task.
+    response so the worker's readinto raises and the coroutine unwinds
+    cleanly, then clear _busy. Polled by main.network_task.
 
     Clearing _busy here can't cause a duplicate announcement because the
     cooldown was already marked eagerly when the 200/204 came back."""
@@ -227,33 +225,27 @@ def watchdog_check():
         _status("Timed out")
 
 
-# ===== Worker thread =====
+# ===== Worker task =====
 
-def _ensure_worker():
-    global _worker_started
-    if not _worker_started:
-        _worker_started = True
-        _thread.start_new_thread(_worker_loop, ())
-
-
-def _worker_loop():
-    """Long-lived worker. Polls _pending; processes one request at a time.
-    Outer try/except keeps the loop alive even when a request crashes — a
-    dead worker would silently brick the device because nothing else
-    monitors thread liveness."""
+async def worker_task():
+    """Long-lived async worker. Awaits _pending_event; processes one request
+    at a time. Outer try/except keeps the loop alive even when a request
+    crashes — a dead worker would silently brick the device because nothing
+    else monitors task liveness."""
     global _busy, _pending
     while True:
         try:
+            await _pending_event.wait()
+            _pending_event.clear()
             pending = _pending
             if pending is None:
-                time.sleep_ms(100)
                 continue
             kind, args = pending
             try:
                 if kind == 'announcement':
-                    _do_announcement(*args)
+                    await _do_announcement(*args)
                 elif kind == 'voice':
-                    _do_voice(*args)
+                    await _do_voice(*args)
                 else:
                     print("[voice] unknown request kind:", kind)
             finally:
@@ -264,12 +256,12 @@ def _worker_loop():
             print("[voice] worker loop error:", e)
             _pending = None
             _busy = False
-            time.sleep_ms(500)
+            await asyncio.sleep_ms(500)
 
 
 # ===== Announcement flow =====
 
-def _do_announcement(location, t, h, co2, context, on_response_ok):
+async def _do_announcement(location, t, h, co2, context, on_response_ok):
     body = {"location": location, "context": context, "language": "en-US"}
     if t is not None: body["indoor_temp"] = t
     if h is not None: body["indoor_humidity"] = h
@@ -279,7 +271,7 @@ def _do_announcement(location, t, h, co2, context, on_response_ok):
         "X-Shared-Secret": SHARED_SECRET,
     }
 
-    pcm = _post_and_read_pcm(
+    pcm = await _post_and_read_pcm(
         url=ANNOUNCEMENT_URL,
         data=json.dumps(body),
         headers=headers,
@@ -291,7 +283,7 @@ def _do_announcement(location, t, h, co2, context, on_response_ok):
         ),
     )
     if pcm:
-        _play_pcm(pcm)
+        await _play_pcm(pcm)
 
 
 def _on_announcement_response(status_code, reply_text, context, on_response_ok):
@@ -309,7 +301,7 @@ def _on_announcement_response(status_code, reply_text, context, on_response_ok):
 
 # ===== Voice-assistant flow =====
 
-def _do_voice(audio_bytes):
+async def _do_voice(audio_bytes):
     _status("Asking...")
     wav = bytes(_wav_header(len(audio_bytes))) + audio_bytes
     headers = {
@@ -319,7 +311,7 @@ def _do_voice(audio_bytes):
     if _device_location:
         headers["X-Device-Location"] = str(_device_location)
 
-    pcm = _post_and_read_pcm(
+    pcm = await _post_and_read_pcm(
         url=VOICE_URL,
         data=wav,
         headers=headers,
@@ -330,7 +322,7 @@ def _do_voice(audio_bytes):
     )
     if pcm:
         _status("Speaking...")
-        _play_pcm(pcm)
+        await _play_pcm(pcm)
         _status("Ready")
     else:
         _status("Error")
@@ -346,8 +338,8 @@ def _on_voice_response(status_code, reply_text):
 
 # ===== HTTP helper (shared by both flows) =====
 
-def _post_and_read_pcm(url, data, headers, connect_timeout_s, body_timeout_s,
-                       log_tag, on_response):
+async def _post_and_read_pcm(url, data, headers, connect_timeout_s, body_timeout_s,
+                              log_tag, on_response):
     """POST and read a PCM response body. Returns body bytes or None on any
     failure. on_response(status_code, reply_text) runs after headers arrive
     but before the body read, regardless of status."""
@@ -355,6 +347,8 @@ def _post_and_read_pcm(url, data, headers, connect_timeout_s, body_timeout_s,
     t0 = time.ticks_ms()
     resp = None
     try:
+        # Yield once before the blocking POST so any queued UI work flushes.
+        await asyncio.sleep_ms(0)
         try:
             resp = requests2.post(url, data=data, headers=headers,
                                   timeout=connect_timeout_s)
@@ -379,7 +373,7 @@ def _post_and_read_pcm(url, data, headers, connect_timeout_s, body_timeout_s,
             return None
 
         deadline_ms = time.ticks_add(time.ticks_ms(), body_timeout_s * 1000)
-        body, ok, path = _read_body_with_deadline(resp, deadline_ms)
+        body, ok, path = await _read_body_with_deadline(resp, deadline_ms)
         t2 = time.ticks_ms()
 
         print("[{}] timings: post={}ms body={}ms({}) size={}B".format(
@@ -399,9 +393,10 @@ def _post_and_read_pcm(url, data, headers, connect_timeout_s, body_timeout_s,
                 pass
 
 
-def _read_body_with_deadline(resp, deadline_ms):
+async def _read_body_with_deadline(resp, deadline_ms):
     """Read PCM body in chunks with a hard deadline + per-read socket
-    timeout (best-effort). Returns (bytes, ok, path_label)."""
+    timeout (best-effort). Yields to the loop between chunks so the watchdog
+    + UI tasks can run. Returns (bytes, ok, path_label)."""
     raw = getattr(resp, "raw", None)
     if raw is None:
         try:
@@ -437,6 +432,7 @@ def _read_body_with_deadline(resp, deadline_ms):
             if not n:
                 break
             pos += n
+            await asyncio.sleep_ms(0)
         if pos < clen:
             return bytes(pcm[:pos]), True, "readinto"
         return bytes(pcm), True, "readinto"
@@ -454,6 +450,7 @@ def _read_body_with_deadline(resp, deadline_ms):
         if not chunk:
             break
         pcm.extend(chunk)
+        await asyncio.sleep_ms(0)
     return bytes(pcm), True, "extend"
 
 
@@ -534,7 +531,7 @@ def _wav_header(data_size, sample_rate=SAMPLE_RATE, num_channels=1, bits_per_sam
 
 # ===== Speaker =====
 
-def _play_pcm(pcm):
+async def _play_pcm(pcm):
     """Play raw 16 kHz / 16-bit / mono PCM through the speaker, capped by
     MAX_PLAYBACK_S so a stuck Speaker.isPlaying() flag can't trap the worker.
     Mic and Speaker share I2S, so we own Speaker.begin/end here."""
@@ -546,5 +543,5 @@ def _play_pcm(pcm):
         if time.ticks_diff(deadline, time.ticks_ms()) <= 0:
             print("[voice] playback cap hit, forcing stop")
             break
-        time.sleep_ms(20)
+        await asyncio.sleep_ms(20)
     Speaker.end()

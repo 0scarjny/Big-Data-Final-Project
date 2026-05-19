@@ -1,6 +1,5 @@
 import time
 import asyncio
-import _thread
 import ntptime
 
 import M5
@@ -34,8 +33,6 @@ location_str = None
 
 is_sending = False
 send_started_ms = 0
-
-_sensor_reading = False  # re-entrancy guard for the sensor worker thread
 
 # WifiManager2 lifecycle state. _ap_mode_active is True only while the user
 # is on the configuration page (page 3) — AP radio + HTTP server are torn
@@ -123,7 +120,7 @@ def _on_page_change(prev, now):
         _exit_config_mode()
 
 
-def _ntp_sync_thread():
+async def _ntp_sync():
     """Try each NTP server in order, retrying across multiple rounds.
 
     A short initial delay lets the AP radio finish tearing down and the
@@ -131,23 +128,30 @@ def _ntp_sync_thread():
     otherwise the very first attempt races the post-boot AP disable and
     times out even on a healthy connection."""
     global _ntp_synced
-    import time as _time
-    _time.sleep(3)  # wait for AP teardown + routing table to settle
+    await asyncio.sleep(3)  # wait for AP teardown + routing table to settle
     for attempt in range(1, _NTP_RETRIES + 1):
         for host in _NTP_SERVERS:
             try:
                 ntptime.host = host
-                ntptime.settime()  # sets RTC to UTC
+                ntptime.settime()  # sets RTC to UTC (blocking, ~1-2 s)
                 _ntp_synced = True
                 print("[ntp] synced via", host)
                 return
             except Exception as e:
                 print("[ntp] {} failed: {}".format(host, e))
+            await asyncio.sleep_ms(0)
         if attempt < _NTP_RETRIES:
             print("[ntp] round {}/{} failed, retrying in {}s".format(
                 attempt, _NTP_RETRIES, _NTP_RETRY_DELAY_S))
-            _time.sleep(_NTP_RETRY_DELAY_S)
+            await asyncio.sleep(_NTP_RETRY_DELAY_S)
     print("[ntp] all servers failed after {} rounds".format(_NTP_RETRIES))
+
+
+async def _fetch_location_task():
+    """Run cloud.fetch_location and propagate the result through the same
+    update path as the manual override."""
+    loc = await cloud.fetch_location(wlan_sta)
+    _on_location_done(loc)
 
 
 def _on_wifi_event(event, **kw):
@@ -160,14 +164,14 @@ def _on_wifi_event(event, **kw):
     if event == "connected":
         ui.refresh_wifi_indicator()
         if not _ntp_synced:
-            _thread.start_new_thread(_ntp_sync_thread, ())
+            asyncio.create_task(_ntp_sync())
         if not _location_fetch_started:
             _location_fetch_started = True
             override = device_settings.get('location_override')
             if override:
                 _on_location_done(override)
             elif wlan_sta is not None:
-                _thread.start_new_thread(cloud.fetch_location, (wlan_sta, _on_location_done))
+                asyncio.create_task(_fetch_location_task())
     elif event in ("disconnected", "connection_failed"):
         ui.refresh_wifi_indicator()
 
@@ -198,8 +202,6 @@ def init_hardware():
 
     time.timezone(device_settings.get('timezone'))
 
-    _thread.stack_size(16384)
-
     ui.init(wlan_sta)
 
 
@@ -209,11 +211,6 @@ def _on_location_done(loc):
         location_str = str(loc)
         ui.set_location(location_str)
         voice_client.set_location(location_str)
-
-
-def _on_send_done():
-    global is_sending
-    is_sending = False
 
 
 def read_sensor():
@@ -235,29 +232,6 @@ def read_sensor():
                 ui.set_co2(co2)
     except Exception as e:
         print("Sensor read error:", e)
-
-
-def _sensor_thread():
-    """Worker that runs read_sensor off the asyncio loop so the ~50–100 ms
-    I2C round-trip never blocks button polling."""
-    global _sensor_reading
-    try:
-        read_sensor()
-    finally:
-        _sensor_reading = False
-
-
-def _forecast_thread():
-    """Worker thread for forecast.fetch(). HTTP must never block the asyncio
-    loop, and the UI update is fast (in-memory dict + LVGL writes)."""
-    try:
-        data = forecast.fetch(location_str)
-        ui.update_forecast(data)
-    except Exception as e:
-        print("[forecast] thread error:", e)
-        ui.update_forecast(None)
-    finally:
-        ui.set_forecast_fetching(False)
 
 
 # ----------------------------------------------------------------------------
@@ -292,20 +266,17 @@ async def clock_task():
 
 
 async def sensor_task():
-    """Dispatches read_sensor to a worker thread so I2C never blocks the
-    asyncio loop. Cadence is 5 s while the dashboard is visible (live UI)
-    and 30 s otherwise — still always fresher than the per-minute cloud upload.
+    """I2C reads inline on the asyncio loop. Cadence is 5 s while the
+    dashboard is visible (live UI) and 30 s otherwise — still always
+    fresher than the per-minute cloud upload.
 
     Pauses entirely while in AP mode so the HTTP config server has the cycles
     it needs for socket IO and JSON parsing."""
-    global _sensor_reading
     while True:
         if is_ap_mode():
             await asyncio.sleep(2)
             continue
-        if not _sensor_reading:
-            _sensor_reading = True
-            _thread.start_new_thread(_sensor_thread, ())
+        read_sensor()
         if ui.is_dashboard_active():
             await asyncio.sleep(5)
         else:
@@ -314,8 +285,7 @@ async def sensor_task():
 
 async def forecast_task():
     """Refresh the forecast every FORECAST_REFRESH_S. First fetch waits for
-    Wi-Fi to come up. Each fetch runs in a worker thread so HTTP doesn't
-    stall the asyncio loop."""
+    Wi-Fi to come up."""
     ui.forecast_show_loading()
 
     # Wait for Wi-Fi before the first live fetch.
@@ -330,8 +300,25 @@ async def forecast_task():
             continue
         if wlan_sta.isconnected() and not ui.forecast_is_fetching():
             ui.set_forecast_fetching(True)
-            _thread.start_new_thread(_forecast_thread, ())
+            try:
+                data = await forecast.fetch(location_str)
+                ui.update_forecast(data)
+            except Exception as e:
+                print("[forecast] task error:", e)
+                ui.update_forecast(None)
+            finally:
+                ui.set_forecast_fetching(False)
         await asyncio.sleep(FORECAST_REFRESH_S)
+
+
+async def _send_data_task():
+    """Wrap cloud.send_data so the network_task can fire-and-forget it
+    while still clearing the in-flight flag when it returns."""
+    global is_sending
+    try:
+        await cloud.send_data(temperature, humidity, co2, location_str)
+    finally:
+        is_sending = False
 
 
 async def network_task():
@@ -378,10 +365,7 @@ async def network_task():
 
         is_sending = True
         send_started_ms = time.ticks_ms()
-        _thread.start_new_thread(
-            cloud.send_data,
-            (temperature, humidity, co2, location_str, _on_send_done),
-        )
+        asyncio.create_task(_send_data_task())
 
 
 async def presence_task():
@@ -417,16 +401,6 @@ async def presence_task():
             ctx,
             on_response_ok=lambda ctx=ctx: presence.mark_announced(ctx, time.localtime()),
         )
-
-
-async def ui_render_task():
-    """Drains ui._pending into LVGL on the asyncio loop. This is the *only*
-    thread that touches LVGL after init() — worker threads queue updates via
-    ui.set_*/update_*, and this task applies them. Step 2 of the
-    snappy-lantern plan."""
-    while True:
-        await ui.wait_dirty()
-        ui.flush_pending()
 
 
 async def wifi_keepalive_task():
@@ -507,7 +481,6 @@ async def main():
         print("[main] STA failed after {} attempts - entering config mode".format(BOOT_WIFI_ATTEMPTS))
         ui.go_to_page(3)
 
-    asyncio.create_task(ui_render_task())
     asyncio.create_task(wifi_keepalive_task())
     asyncio.create_task(ui_task())
     asyncio.create_task(clock_task())
@@ -515,6 +488,7 @@ async def main():
     asyncio.create_task(network_task())
     asyncio.create_task(forecast_task())
     asyncio.create_task(presence_task())
+    asyncio.create_task(voice_client.worker_task())
     while True:
         await asyncio.sleep(3600)
 

@@ -5,11 +5,11 @@
 #   flash_success() — 1-second green hold on a 200 response
 #   flash_error()   — 2-second red hold on a 4xx/5xx/network failure
 #
-# All blink calls block the calling thread (which is cloud.send_data's worker
-# thread), never the asyncio loop that handles UI/buttons. If init() fails
-# (no RGB attached, wrong firmware), every flash function becomes a no-op.
+# Coroutines: pauses yield to the asyncio loop so other tasks keep running
+# during the LED animation. If init() fails (no RGB attached, wrong firmware),
+# every flash function becomes a no-op.
 
-import time
+import asyncio
 
 try:
     from hardware import RGB
@@ -66,30 +66,30 @@ def _set(color):
         print("[led] set error:", e)
 
 
-def flash_sending():
+async def flash_sending():
     """5 rapid green blinks (~1 s total) — 'uploading to BigQuery'."""
     if _rgb is None or not _enabled:
         return
     for _ in range(5):
         _set(GREEN)
-        time.sleep_ms(100)
+        await asyncio.sleep_ms(100)
         _set(OFF)
-        time.sleep_ms(100)
+        await asyncio.sleep_ms(100)
 
 
-def flash_success():
+async def flash_success():
     """1-second green hold — 200 response from the backend."""
     if _rgb is None or not _enabled:
         return
     _set(GREEN)
-    time.sleep(1)
+    await asyncio.sleep(1)
     _set(OFF)
 
 
-def flash_error():
+async def flash_error():
     """2-second red hold — 4xx/5xx response or network failure."""
     if _rgb is None or not _enabled:
         return
     _set(RED)
-    time.sleep(2)
+    await asyncio.sleep(2)
     _set(OFF)

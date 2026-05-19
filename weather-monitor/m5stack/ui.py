@@ -1,6 +1,4 @@
 import time
-import _thread
-import asyncio
 import lvgl as lv
 import m5ui
 
@@ -78,111 +76,9 @@ def _ui_log(*args):
 
 
 # ---------------------------------------------------------------------------
-# Thread-safety harness
-#
-# LVGL is touched only from the asyncio "main" thread. Worker threads call the
-# public set_*/update_* wrappers, which write into _pending under
-# _pending_lock and signal _dirty_flag. The ui_render_task coroutine in
-# main.py drains _pending on its next tick via flush_pending(), which calls
-# the private _apply_* helpers — those perform the actual LVGL writes and are
-# guarded by _assert_main().
+# Single-loop UI. All updates come from coroutines on the asyncio event loop,
+# so LVGL writes can happen directly — no queue, no lock, no ThreadSafeFlag.
 # ---------------------------------------------------------------------------
-
-_main_thread_id = None
-_pending = {}
-_pending_lock = _thread.allocate_lock()
-# _signal_pending is True from the moment a worker calls _dirty_flag.set() up
-# until flush_pending() runs. While it's True, additional _queue() calls just
-# write into _pending and skip the .set() — this coalescing is essential:
-# ThreadSafeFlag.set() uses micropython.schedule() internally, whose queue is
-# only 8 slots. Without coalescing, a busy worker can flood it and m5ui's
-# LVGL tick callback dies with `RuntimeError: schedule queue full`.
-_signal_pending = False
-try:
-    _dirty_flag = asyncio.ThreadSafeFlag()
-    _has_threadsafe_flag = True
-except Exception:
-    _dirty_flag = None
-    _has_threadsafe_flag = False
-
-
-def _assert_main():
-    """Diagnostic guard: prints a loud warning if an LVGL write happens off
-    the main thread. After step 2 of the snappy-lantern plan this should
-    never fire — until then it's a regression beacon."""
-    if _main_thread_id is None:
-        return
-    tid = _thread.get_ident()
-    if tid != _main_thread_id:
-        print("[ui] WRONG THREAD: tid={} expected={}".format(tid, _main_thread_id))
-
-
-def _queue(key, value=True):
-    """Thread-safe enqueue. The check-and-flip of _signal_pending lives inside
-    the lock so two workers can never both call _dirty_flag.set(). At most one
-    micropython.schedule() slot is consumed between flushes, regardless of
-    update rate."""
-    global _signal_pending
-    need_signal = False
-    _pending_lock.acquire()
-    try:
-        _pending[key] = value
-        if not _signal_pending:
-            _signal_pending = True
-            need_signal = True
-    finally:
-        _pending_lock.release()
-    if need_signal and _has_threadsafe_flag:
-        try:
-            _dirty_flag.set()
-        except Exception:
-            pass
-
-
-async def wait_dirty():
-    """Awaited by main.ui_render_task. Parks on the ThreadSafeFlag when
-    available; falls back to a 50 ms poll on firmwares that don't expose
-    it."""
-    if _has_threadsafe_flag:
-        await _dirty_flag.wait()
-    else:
-        await asyncio.sleep_ms(50)
-
-
-def flush_pending():
-    """Drain queued state into LVGL. Main-thread only."""
-    _assert_main()
-    global _pending, _signal_pending
-    _pending_lock.acquire()
-    try:
-        snapshot = _pending
-        _pending = {}
-        # Reset under the lock so any worker that observed _signal_pending=True
-        # mid-flush is guaranteed to have its write captured in `snapshot`; any
-        # worker arriving after this re-arms a fresh schedule slot.
-        _signal_pending = False
-    finally:
-        _pending_lock.release()
-    # MicroPython dicts preserve insertion order; the most recent enqueue per
-    # key wins because _queue overwrites by key.
-    for key, val in snapshot.items():
-        try:
-            if key == 'temperature':         _apply_temperature(val)
-            elif key == 'humidity':          _apply_humidity(val)
-            elif key == 'co2':               _apply_co2(val)
-            elif key == 'location':          _apply_location(val)
-            elif key == 'clock':             _apply_clock()
-            elif key == 'wifi_indicator':    _apply_wifi_indicator()
-            elif key == 'forecast_data':     _apply_forecast_data(val)
-            elif key == 'forecast_loading':  _apply_forecast_loading()
-            elif key == 'cfg_ap':            _apply_cfg_ap(val)
-            elif key == 'cfg_connected':     _apply_cfg_connected(*val)
-            elif key == 'cfg_disconnected':  _apply_cfg_disconnected()
-            elif key == 'voice_status':      _apply_voice_status(val)
-            elif key == 'voice_reply':       _apply_voice_reply(val)
-            elif key == 'voice_spinner':     _apply_voice_spinner(val)
-        except Exception as e:
-            _ui_log("apply error:", key, e)
 
 
 def safe_font(size):
@@ -554,7 +450,6 @@ def _build_config_page(font_small, font_tiny, text_color, bg_color):
 
 def _set_qr(text):
     """Update the QR widget (or the text fallback) with a new URL."""
-    _assert_main()
     if cfg_qr is not None:
         try:
             try:
@@ -574,7 +469,7 @@ def _set_qr(text):
 
 
 def init(wlan_sta):
-    global _wlan_sta, _main_thread_id
+    global _wlan_sta
     _wlan_sta = wlan_sta
 
     def _load_roboto(size):
@@ -618,54 +513,48 @@ def init(wlan_sta):
 
     page0.screen_load()
 
-    # Capture the asyncio loop's thread id. init() is called from main() which
-    # runs inside asyncio.run, so this IS the main thread we want every LVGL
-    # write to come from.
-    _main_thread_id = _thread.get_ident()
-
 
 # ----------------------------------------------------------------------------
-# Public, thread-safe setters (callable from any thread)
+# Public setters. Direct LVGL writes — safe because every caller runs on the
+# single asyncio loop.
 # ----------------------------------------------------------------------------
 
-def set_temperature(v):        _queue('temperature', v)
-def set_humidity(v):           _queue('humidity', v)
-def set_co2(v):                _queue('co2', v)
-def set_location(s):           _queue('location', s)
-def update_clock():            _queue('clock')
-def refresh_wifi_indicator():  _queue('wifi_indicator')
-def update_forecast(data):     _queue('forecast_data', data)
-def forecast_show_loading():   _queue('forecast_loading')
+def set_temperature(v):        _apply_temperature(v)
+def set_humidity(v):           _apply_humidity(v)
+def set_co2(v):                _apply_co2(v)
+def set_location(s):           _apply_location(s)
+def update_clock():            _apply_clock()
+def refresh_wifi_indicator():  _apply_wifi_indicator()
+def update_forecast(data):     _apply_forecast_data(data)
+def forecast_show_loading():   _apply_forecast_loading()
 
 
 def set_config_status_ap(info):
     """Render the AP-mode UI: red status, QR + visible AP credentials."""
-    _queue('cfg_ap', info)
+    _apply_cfg_ap(info)
 
 
 def set_config_status_connected(ssid, ip, url):
     """Render the connected-mode UI: green status, QR points to the device IP
     so the same web form is reachable from a phone on the same LAN."""
-    _queue('cfg_connected', (ssid, ip, url))
+    _apply_cfg_connected(ssid, ip, url)
 
 
 def set_config_status_disconnected():
-    _queue('cfg_disconnected')
+    _apply_cfg_disconnected()
 
 
-# Voice callbacks registered with voice_client.register_callbacks. The voice
-# worker thread fires these; they queue and return immediately so no LVGL
-# call ever happens off the main thread.
+# Voice callbacks registered with voice_client.register_callbacks.
 def _set_voice_status(text):
-    _queue('voice_status', text)
+    _apply_voice_status(text)
 
 
 def _set_voice_reply(text):
-    _queue('voice_reply', text)
+    _apply_voice_reply(text)
 
 
 def _show_voice_spinner(visible):
-    _queue('voice_spinner', bool(visible))
+    _apply_voice_spinner(bool(visible))
 
 
 # ----------------------------------------------------------------------------
@@ -673,12 +562,10 @@ def _show_voice_spinner(visible):
 # ----------------------------------------------------------------------------
 
 def _apply_temperature(temperature):
-    _assert_main()
     temp_val_label.set_text("{:.1f}°C".format(temperature))
 
 
 def _apply_humidity(humidity):
-    _assert_main()
     clamped = max(0, min(100, humidity))
     arrow_x = 5 + int((clamped / 100.0) * 310)
     comfort_arrow.set_pos(arrow_x - 5, 205)
@@ -687,17 +574,14 @@ def _apply_humidity(humidity):
 
 
 def _apply_co2(co2):
-    _assert_main()
     co2_label.set_text("{} ppm".format(co2))
 
 
 def _apply_location(location_str):
-    _assert_main()
     location_label.set_text(location_str.upper() if location_str else "")
 
 
 def _apply_clock():
-    _assert_main()
     t = time.localtime()
     hour, minute, second, month, day, dow = t[3], t[4], t[5], t[1], t[2], t[6]
     h12 = hour % 12 or 12
@@ -711,7 +595,6 @@ def _apply_wifi_indicator():
     """Recolour the dashboard Wi-Fi icon based on the STA association.
     Status text on the config page is driven by the cfg_* appliers — this
     function only owns the icon."""
-    _assert_main()
     try:
         if _wlan_sta is not None and _wlan_sta.isconnected():
             wifi_ind.set_text_color(0x2ECC71, 255, lv.PART.MAIN)
@@ -724,7 +607,6 @@ def _apply_wifi_indicator():
 def _apply_forecast_data(data):
     """Stores the raw data and re-renders if the user is currently looking at
     this page."""
-    _assert_main()
     global _forecast_data
     _forecast_data = data
     if data is None:
@@ -735,12 +617,10 @@ def _apply_forecast_data(data):
 
 
 def _apply_forecast_loading():
-    _assert_main()
     forecast_status.set_text("Loading forecast...")
 
 
 def _apply_cfg_ap(info):
-    _assert_main()
     try:
         cfg_status_label.set_text("AP mode - connect to set up device")
         cfg_status_label.set_text_color(0xC0392B, 255, lv.PART.MAIN)
@@ -752,7 +632,6 @@ def _apply_cfg_ap(info):
 
 
 def _apply_cfg_connected(ssid, ip, url):
-    _assert_main()
     try:
         cfg_status_label.set_text("Connected - " + ssid)
         cfg_status_label.set_text_color(0x27AE60, 255, lv.PART.MAIN)
@@ -764,7 +643,6 @@ def _apply_cfg_connected(ssid, ip, url):
 
 
 def _apply_cfg_disconnected():
-    _assert_main()
     try:
         cfg_status_label.set_text("Disconnected - searching...")
         cfg_status_label.set_text_color(0xE67E22, 255, lv.PART.MAIN)
@@ -776,7 +654,6 @@ def _apply_voice_status(text):
     """Update the status label and the face colour. Three stages only:
         Listening -> Asking -> Speaking -> Ready
     Plus the obvious error / timeout states."""
-    _assert_main()
     try:
         voice_label_status.set_text(text)
     except Exception as e:
@@ -794,7 +671,6 @@ def _apply_voice_status(text):
 
 
 def _apply_voice_reply(text):
-    _assert_main()
     try:
         # LVGL LONG.WRAP on the label handles word-wrap; no manual chunking needed.
         voice_label_reply.set_text(
@@ -806,7 +682,6 @@ def _apply_voice_reply(text):
 
 def _apply_voice_spinner(visible):
     # Spinner widget removed (was laggy). Drive face expression instead.
-    _assert_main()
     _set_face_state("thinking" if visible else "idle")
 
 
@@ -827,7 +702,6 @@ def _format_temp(value):
 def _set_slot_icon(slot, code):
     """Replace the slot's icon glyph. The label is the same instance so
     layout stays stable; only the displayed character changes."""
-    _assert_main()
     icon = slot.get("icon")
     if icon is None:
         return
@@ -852,13 +726,11 @@ def _set_slot_hidden(slot, hidden, week_view=False):
 
 
 def _hide_extra_slots(used_count, week_view=False):
-    _assert_main()
     for i, slot in enumerate(forecast_slots):
         _set_slot_hidden(slot, i >= used_count, week_view=week_view)
 
 
 def _render_today():
-    _assert_main()
     buckets = forecast_mod.today_buckets(_forecast_data, max_slots=FORECAST_SLOTS)
     if not buckets:
         forecast_status.set_text("No forecast data yet")
@@ -875,7 +747,6 @@ def _render_today():
 
 
 def _render_week():
-    _assert_main()
     days = forecast_mod.week_days(_forecast_data, max_days=FORECAST_SLOTS)
     if not days:
         forecast_status.set_text("No forecast data yet")
@@ -893,7 +764,6 @@ def _render_week():
 
 
 def _render_forecast():
-    _assert_main()
     if _forecast_view == "week":
         forecast_title.set_text("Forecast - 5 days")
         forecast_subtitle.set_text("min / max")
@@ -909,7 +779,6 @@ def _render_forecast():
 def forecast_toggle_label_text(text):
     """Set the toggle button label. Wraps a few API differences across m5ui
     versions (some expose set_text on the button itself, others on a child)."""
-    _assert_main()
     try:
         forecast_toggle_btn.set_text(text)
     except AttributeError:
@@ -940,7 +809,6 @@ def set_forecast_fetching(val):
 # ----------------------------------------------------------------------------
 
 def refresh_page():
-    _assert_main()
     _ui_log("refresh_page ->", current_page)
     if current_page == 0:
         page0.screen_load()
@@ -957,7 +825,6 @@ def refresh_page():
 
 
 def go_next_page():
-    _assert_main()
     global current_page
     # Btn-driven nav: dashboard (0) -> forecast (1) -> voice (2) -> config (3).
     if current_page >= 3:
@@ -973,7 +840,6 @@ def go_next_page():
 
 
 def go_prev_page():
-    _assert_main()
     global current_page
     if current_page <= 0:
         return
@@ -991,7 +857,6 @@ def go_to_page(n):
     """Programmatic navigation, used by main.py to jump to page 3 on boot
     when STA fails. Bypasses the voice_client busy check because it's
     invoked outside human nav."""
-    _assert_main()
     global current_page
     if not 0 <= n <= 3 or n == current_page:
         return
@@ -1044,7 +909,6 @@ _FACE_STATES = {
 
 def _set_face_state(state):
     """Swap the face circle's background colour to reflect the current state."""
-    _assert_main()
     if voice_btn_rec is None:
         return
     colour = _FACE_STATES.get(state, _FACE_STATES["idle"])
