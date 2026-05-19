@@ -3,3 +3,12 @@ weather-monitor/test/
 weather-monitor/Flask/src/__pycache__/
 weather-monitor/m5stack/images/
 weather-monitor/m5stack/res/img/
+weather-monitor/web-dashboard/.streamlit/secrets.toml
+weather-monitor/web-dashboard/__pycache__/
+weather-monitor/web-dashboard/**/__pycache__/
+weather-monitor/web-dashboard/.venv/
+weather-monitor/m5stack/__pycache__/
+weather-monitor/m5stack/.DS_Store
+weather-monitor/m5stack/**/.DS_Store
+weather-monitor/m5stack/networks.json
+weather-monitor/m5stack/TODO.md
