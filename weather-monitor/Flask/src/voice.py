@@ -29,7 +29,7 @@ except ImportError:
 log = get_logger("voice_assistant.voice")
 
 
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 8000
 
 # STT: primary + alternates. Google's recognizer auto-picks the best match
 # and reports the chosen one in result.language_code.
@@ -449,7 +449,7 @@ def _fallback_message(facts, language_code):
 
 
 def synthesize(text, language_code=PRIMARY_LANGUAGE):
-    """Returns raw LINEAR16 PCM bytes at 16kHz. No WAV header.
+    """Returns raw LINEAR16 PCM bytes at SAMPLE_RATE (8 kHz). No WAV header.
 
     The voice is picked based on `language_code` (e.g. 'fr-FR' uses a French voice)."""
     lang, voice_name = _voice_for_language(language_code)

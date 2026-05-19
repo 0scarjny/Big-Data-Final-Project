@@ -264,7 +264,7 @@ def voice_assistant():
     log.info("TTS produced %d bytes of PCM audio", len(pcm))
     return Response(
         pcm,
-        mimetype="audio/L16; rate=16000",
+        mimetype="audio/L16; rate=8000",
         headers={
             "X-Response-Text": voice.header_safe(reply_text)[:512],
             "X-Transcript": voice.header_safe(transcript)[:512],
@@ -332,7 +332,7 @@ def critical_announcement():
     pcm = voice.synthesize(reply_text, language_code=language)
     return Response(
         pcm,
-        mimetype="audio/L16; rate=16000",
+        mimetype="audio/L16; rate=8000",
         headers={
             "X-Response-Text": voice.header_safe(reply_text)[:512],
             "X-Language": voice.header_safe(language)[:32],
