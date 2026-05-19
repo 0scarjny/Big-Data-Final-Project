@@ -7,11 +7,12 @@
 
 import _thread
 import time
+import json
 
 from M5 import Mic, Speaker
 import requests2
 
-from config import SHARED_SECRET, VOICE_URL
+from config import SHARED_SECRET, VOICE_URL, ANNOUNCEMENT_URL
 
 # --- Audio config ---
 SAMPLE_RATE = 16000
@@ -232,6 +233,123 @@ def _wav_header(data_size, sample_rate=SAMPLE_RATE, num_channels=1, bits_per_sam
     return h
 
 
+def _play_pcm(pcm):
+    """Play raw 16 kHz / 16-bit / mono PCM through the speaker, capped by
+    MAX_PLAYBACK_S so a stuck Speaker.isPlaying() flag can't trap the worker.
+    Mic and Speaker share I2S, so we own Speaker.begin/end here."""
+    Speaker.begin()
+    Speaker.setVolumePercentage(100)
+    Speaker.playRaw(memoryview(pcm), SAMPLE_RATE)
+    playback_deadline = time.ticks_add(time.ticks_ms(), MAX_PLAYBACK_S * 1000)
+    while Speaker.isPlaying():
+        if time.ticks_diff(playback_deadline, time.ticks_ms()) <= 0:
+            print("[voice] playback cap hit, forcing stop")
+            break
+        time.sleep_ms(20)
+    Speaker.end()
+
+
+# Announcement requests are short JSON → small PCM. No Gemini intent step on
+# the server, so the round-trip is much faster than /voice-assistant.
+ANNOUNCEMENT_TIMEOUT_S = 30
+
+_announce_args = None  # holds (location, temp, humidity, co2, context, on_done)
+
+
+def request_announcement(location, indoor_temp, indoor_humidity, indoor_co2,
+                         context, on_done=None):
+    """Ask the backend whether anything is worth announcing right now and,
+    if so, play the synthesized reply through the speaker.
+
+    Reuses the voice-assistant `_busy` flag + watchdog so concurrent BigQuery
+    uploads defer one cycle (see main.network_task) — two TLS sockets is the
+    exact failure mode the existing comment in main.py warns about.
+
+    `on_done(success: bool)` runs from the worker thread once playback
+    finishes (or once the request errors out). Caller uses this to bump the
+    presence rate-limit only on success.
+    """
+    global _busy, _thread_started_ms, _announce_args
+    if _busy or _recording:
+        return False
+    _busy = True
+    _thread_started_ms = time.ticks_ms()
+    _announce_args = (location, indoor_temp, indoor_humidity, indoor_co2, context, on_done)
+    _thread.start_new_thread(_announcement_thread, ())
+    return True
+
+
+def _announcement_thread():
+    """Single-shot proactive announcement: POST sensor snapshot + context →
+    play returned PCM. No retries — next presence trigger is the retry."""
+    global _busy
+    location, t, h, co2, context, on_done = _announce_args
+    success = False
+    try:
+        body = {
+            "location": location,
+            "context": context,
+            "language": "en-US",
+        }
+        if t is not None:
+            body["indoor_temp"] = t
+        if h is not None:
+            body["indoor_humidity"] = h
+        if co2 is not None:
+            body["indoor_co2"] = co2
+
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shared-Secret": SHARED_SECRET,
+        }
+
+        try:
+            resp = requests2.post(
+                ANNOUNCEMENT_URL,
+                data=json.dumps(body),
+                headers=headers,
+                timeout=ANNOUNCEMENT_TIMEOUT_S,
+            )
+        except Exception as e:
+            print("[announce] network error:", e)
+            return
+
+        try:
+            if resp.status_code == 204:
+                # Server decided nothing was worth saying (e.g. morning_check
+                # with no rain). Still treat as success so we honour the
+                # cooldown and don't re-poll the endpoint immediately.
+                print("[announce] 204 no content (silent)")
+                success = True
+                return
+
+            if resp.status_code != 200:
+                print("[announce] HTTP", resp.status_code)
+                return
+
+            reply_text = _get_header(getattr(resp, "headers", None), "X-Response-Text")
+            if reply_text:
+                print("[announce] saying:", reply_text)
+            pcm = resp.content
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        _play_pcm(pcm)
+        success = True
+    except Exception as e:
+        print("[announce] thread error:", e)
+    finally:
+        _busy = False
+        if on_done:
+            try:
+                on_done(success)
+            except Exception as e:
+                print("[announce] on_done error:", e)
+
+
 def _ask_backend_thread():
     """Single-shot voice request:
         Asking... -> Speaking... -> Ready
@@ -294,16 +412,7 @@ def _ask_backend_thread():
         _spinner(False)
         _status("Speaking...")
 
-        Speaker.begin()
-        Speaker.setVolumePercentage(100)
-        Speaker.playRaw(memoryview(pcm), SAMPLE_RATE)
-        playback_deadline = time.ticks_add(time.ticks_ms(), MAX_PLAYBACK_S * 1000)
-        while Speaker.isPlaying():
-            if time.ticks_diff(playback_deadline, time.ticks_ms()) <= 0:
-                print("[voice] playback cap hit, forcing stop")
-                break
-            time.sleep_ms(20)
-        Speaker.end()
+        _play_pcm(pcm)
 
         _status("Ready")
     except Exception as e:

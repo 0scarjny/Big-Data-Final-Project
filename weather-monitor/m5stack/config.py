@@ -2,9 +2,10 @@
 
 BASE_URL = 'https://flask-app-868833155300.europe-west6.run.app'
 
-BIGQUERY_URL = BASE_URL + '/send-to-bigquery'
-VOICE_URL    = BASE_URL + '/voice-assistant'
-FORECAST_URL = BASE_URL + '/get_forecast'
+BIGQUERY_URL     = BASE_URL + '/send-to-bigquery'
+VOICE_URL        = BASE_URL + '/voice-assistant'
+FORECAST_URL     = BASE_URL + '/get_forecast'
+ANNOUNCEMENT_URL = BASE_URL + '/critical-announcement'
 
 
 # Centralised secrets. TODO: rotate and externalize — the previous values

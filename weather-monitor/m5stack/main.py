@@ -18,6 +18,7 @@ import led
 import voice_client
 import forecast
 import device_settings
+import presence
 
 SEND_TIMEOUT_MS = 45_000  # watchdog: force-reset is_sending after this long
 FORECAST_REFRESH_S = 30 * 60  # 30 min between forecast refreshes
@@ -192,6 +193,8 @@ def init_hardware():
 
     led.init()  # RGB status indicator (no-op if hardware isn't present)
     led.set_enabled(device_settings.get('led_signals_enabled'))
+
+    presence.init()  # PIR Unit on Port B (G36) for proactive announcements
 
     time.timezone(device_settings.get('timezone'))
 
@@ -381,6 +384,40 @@ async def network_task():
         )
 
 
+async def presence_task():
+    """Poll the PIR every 500 ms; on motion, ask the backend whether anything
+    is worth announcing right now. The hourly cooldown + morning-window
+    bookkeeping live in presence.py — this task is just the dispatcher.
+
+    Defers when:
+      - in AP/config mode (no STA),
+      - Wi-Fi is down,
+      - the voice assistant or a BigQuery upload is in flight (shared
+        voice_client._busy flag prevents two TLS sockets fighting on the
+        ESP32 stack — see the comment in network_task)."""
+    while True:
+        await asyncio.sleep_ms(500)
+        if is_ap_mode():
+            continue
+        if wlan_sta is None or not wlan_sta.isconnected():
+            continue
+        if voice_client.is_busy() or is_sending:
+            continue
+        if not presence.is_motion():
+            continue
+        ctx = presence.should_announce(time.localtime())
+        if ctx is None:
+            continue
+        # Capture ctx in the lambda default so the closure sees the right
+        # value if a second trigger arrives before this one resolves.
+        voice_client.request_announcement(
+            location_str or "Lausanne",
+            temperature, humidity, co2,
+            ctx,
+            on_done=lambda ok, ctx=ctx: presence.mark_announced(ctx, time.localtime()) if ok else None,
+        )
+
+
 async def ui_render_task():
     """Drains ui._pending into LVGL on the asyncio loop. This is the *only*
     thread that touches LVGL after init() — worker threads queue updates via
@@ -476,6 +513,7 @@ async def main():
     asyncio.create_task(sensor_task())
     asyncio.create_task(network_task())
     asyncio.create_task(forecast_task())
+    asyncio.create_task(presence_task())
     while True:
         await asyncio.sleep(3600)
 
